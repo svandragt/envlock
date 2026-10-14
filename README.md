@@ -29,9 +29,12 @@ envpool_create() { ...; }    # build $ENVLOCK_ENV, including its database; retur
 envpool_destroy() { ...; }   # remove $ENVLOCK_ENV; return non-zero on failure. Without it the pool never shrinks
 envpool_describe() { ...; }  # print the attributes of $ENVLOCK_ENV as key=value pairs, for example: wp=7.1 php=8.4
 envpool_configure() { ...; } # change $ENVLOCK_ENV to the key=value pairs in "$@"; return non-zero on failure
+envpool_info() { ...; }      # print a hint for the agent after each acquire, for example a login URL for $ENVLOCK_ENV
 ```
 
 Only `ENVS` is required. Leave out `ENVPOOL_MAX` and `envpool_create` to keep the pool a fixed size. [`examples/vip.envpool`](examples/vip.envpool) is a complete example for VIP dev-env sites.
+
+After every `envlock acquire`, including when the worktree already holds a lease, envlock prints the output of `envpool_info` on stderr. `name=$(envlock acquire)` still gets only the name. The VIP example prints an https URL that logs in to the site's admin without a password.
 
 envlock remembers which worktree it last switched each environment to. When the same worktree comes back, envlock skips `envpool_attach`, as long as `envpool_healthy` returns 0 or does not exist. If `envpool_attach` fails, envlock forgets the switch and runs it again next time. If two projects list the same environment, they share one lock.
 

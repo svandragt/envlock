@@ -51,14 +51,35 @@ If the file is missing, stop and tell the user that the repo needs an untracked
    Read `root_pane.pane_id`, `workspace.workspace_id` and `worktree.path` from the
    JSON (under `.result` if the output has that wrapper). If the command fails,
    report it, skip this ticket and continue with the next.
-3. Start Claude in that pane:
+3. Name the agent. herdr accepts only names that start with a lowercase letter, contain
+   only `a-z`, `0-9`, `_` and `-`, and are 1 to 32 characters long, so the ticket ID alone
+   (`ABC-740`, `1234`) is rejected. Use `t-` plus the lowercased ticket ID, with any other
+   character turned into `-` and the result cut to 32 characters:
 
    ```bash
-   herdr agent start <ticket> --kind claude --pane <pane_id>
+   name=$(printf 't-%s' "<ticket>" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_-' - | cut -c1-32)
    ```
 
-4. Send the brief with `herdr agent prompt <ticket> "<brief>"`. If the target is
-   not accepted, use the name that `herdr agent list` shows for the pane. The brief says:
+   `ABC-740` gives `t-abc-740` and `1234` gives `t-1234`. Use this name wherever the steps
+   below say `<name>`.
+4. Start Claude in that pane, then wait until it is ready:
+
+   ```bash
+   herdr agent start <name> --kind claude --pane <pane_id>
+   herdr agent wait <name> --until idle --timeout 120000
+   ```
+
+   `agent start` times out when the new session stops at a startup prompt, such as
+   Claude's "Do you trust this folder?" for a new worktree. If it times out, still run the
+   wait. If the session is not idle after the wait, it is not ready: tell the user which
+   workspace needs their attention, send no brief to it, and continue with the other tickets.
+
+   - Claude keys folder trust for a worktree on the main checkout's root, so trusting the
+     repo's main checkout once should avoid the trust prompt.
+   - If a pane shows a password prompt, a shell wrapper around `claude` is the cause.
+5. Send the brief only after the session is idle, with `herdr agent prompt <name> "<brief>"`.
+   If the target is not accepted, use the name that `herdr agent list` shows for the pane.
+   The brief says:
 
    - Your ticket is `<ticket>`. Read the ticket first, then work on it in this worktree.
    - Before anything that needs the environment, run `envlock acquire --wait 3600`.
@@ -76,4 +97,4 @@ If the file is missing, stop and tell the user that the repo needs an untracked
 ## Finish
 
 List one line per ticket as `ticket -> workspace id -> branch`, then the output of
-`envlock status` run from `<repo>`. Name any ticket that was skipped and why.
+`envlock status` run from `<repo>`. Name any ticket that was skipped and why, and any session that was not ready, with its workspace id.

@@ -13,6 +13,9 @@
 # acquire --want key=value only prefers an env that has them.
 # envpool_configure key=value... (sees ENVLOCK_ENV, same contract as
 # envpool_create) changes an env that lacks a needed pair, before reset and attach.
+# envpool_info (sees ENVLOCK_ENV and ENVLOCK_WORKTREE) prints a hint for the caller,
+# such as a login URL, after every successful acquire, new lease or reuse.
+# Every hook runs with envlock's lock fds closed, so nothing a hook starts holds a lock.
 set -euo pipefail
 
 usage() {
@@ -24,6 +27,9 @@ usage() {
 	echo "       envlock shrink" >&2
 	exit 2
 }
+
+# Runs hook $1 with envlock's lock fds closed (7 the shrink candidate's lease, 8 the pool, 9 the lease), so neither the hook nor a child it leaves running inherits a lock that envlock still holds.
+hook() { "$@" 7>&- 8>&- 9>&-; }
 
 # These two functions are the only herdr-specific code.
 # Prints the id of the calling agent session; fails with a message when there is none.
@@ -65,7 +71,7 @@ load_envs() {
 # Prints env $1's attributes; prints nothing when envpool_describe is missing or fails.
 describe() {
 	local out
-	if declare -F envpool_describe >/dev/null && out=$(ENVLOCK_ENV=$1 envpool_describe); then printf '%s\n' "$out"; fi
+	if declare -F envpool_describe >/dev/null && out=$(ENVLOCK_ENV=$1 hook envpool_describe); then printf '%s\n' "$out"; fi
 }
 
 # Succeeds when the attribute string $1 contains every pair after it.
@@ -83,11 +89,16 @@ needs_met() {
 # Runs envpool_configure on env $1 for the needed pairs. After a failure the env is in an unknown state, so the attach record goes.
 run_configure() {
 	echo "envlock: configuring $1 for ${need[*]}" >&2
-	if ! ENVLOCK_ENV=$1 ENVLOCK_WORKTREE=$worktree envpool_configure "${need[@]}" >&2; then
+	if ! ENVLOCK_ENV=$1 ENVLOCK_WORKTREE=$worktree hook envpool_configure "${need[@]}" >&2; then
 		rm -f "$envdir/$1.attached"
 		echo "envlock: configuring $1 failed" >&2
 		return 1
 	fi
+}
+
+# Runs the optional envpool_info hook for env $1. Its output is a hint for the caller, so a failure never fails the acquire.
+show_info() {
+	if declare -F envpool_info >/dev/null; then ENVLOCK_ENV=$1 ENVLOCK_WORKTREE=$worktree hook envpool_info >&2 || true; fi
 }
 
 can_grow() {
@@ -108,7 +119,6 @@ queue_entries() {
 # With --capped it also refuses to go past ENVPOOL_MAX.
 grow() {
 	local n=2 new
-	# The block closes fd 8 on exit, so envpool_create's leftovers never hold the grow lock.
 	{
 		flock -n 8 || { echo "envlock: another grow is running" >&2; return 2; }
 		load_envs
@@ -116,13 +126,13 @@ grow() {
 		{ declare -F envpool_create >/dev/null && [ -n "${ENVPOOL_PREFIX:-}" ]; } ||
 			{ echo "envlock: .envpool needs ENVPOOL_PREFIX and envpool_create to grow" >&2; return 2; }
 		new=$ENVPOOL_PREFIX$n
-		while [[ " ${all[*]} " == *" $new "* ]] || { declare -F envpool_exists >/dev/null && envpool_exists "$new"; }; do
+		while [[ " ${all[*]} " == *" $new "* ]] || { declare -F envpool_exists >/dev/null && hook envpool_exists "$new"; }; do
 			n=$((n + 1))
 			new=$ENVPOOL_PREFIX$n
 		done
 		echo "envlock: creating $new" >&2
 		# Inside an if, set -e is off, so envpool_create has to return non-zero itself.
-		if ENVLOCK_ENV=$new envpool_create >&2; then
+		if ENVLOCK_ENV=$new hook envpool_create >&2; then
 			echo "$new" >>"$lockdir/envs"
 			echo "envlock: added $new" >&2
 		else
@@ -172,7 +182,7 @@ other_free() {
 shrink() {
 	local e grown removed=''
 	declare -F envpool_destroy >/dev/null || { echo "envlock: .envpool needs envpool_destroy to shrink" >&2; return 2; }
-	# Fd 8 is the pool lock, fd 7 the candidate's lease lock. The blocks close them on exit, so envpool_destroy's leftovers never hold either.
+	# Fd 8 is the pool lock, fd 7 the candidate's lease lock.
 	{
 		flock -n 8 || { echo "envlock: a grow or shrink is running" >&2; return 2; }
 		mapfile -t grown < <(awk 'NF && !seen[$0]++' "$lockdir/envs" 2>/dev/null)
@@ -185,7 +195,7 @@ shrink() {
 				if env_in_use "$e" || ! other_free "$e"; then continue; fi
 				echo "envlock: destroying $e" >&2
 				# Inside an if, set -e is off, so envpool_destroy has to return non-zero itself.
-				if ENVLOCK_ENV=$e envpool_destroy >&2; then
+				if ENVLOCK_ENV=$e hook envpool_destroy >&2; then
 					awk -v e="$e" '$0 != e' "$lockdir/envs" >"$lockdir/envs.tmp" && mv "$lockdir/envs.tmp" "$lockdir/envs"
 					rm -f "$envdir/$e".{holder,attached}
 					echo "envlock: removed $e" >&2
@@ -288,14 +298,14 @@ acquire() {
 	echo "envlock: using $e" >&2
 	[ -z "$mismatch" ] || run_configure "$e" || exit 1
 	# Hook output goes to stderr, so stdout carries only the env name.
-	if declare -F envpool_reset >/dev/null; then envpool_reset >&2; fi
+	if declare -F envpool_reset >/dev/null; then hook envpool_reset >&2; fi
 	if declare -F envpool_attach >/dev/null; then
-		if [ "$(cat "$envdir/$e.attached" 2>/dev/null)" = "$worktree" ] && { ! declare -F envpool_healthy >/dev/null || envpool_healthy >&2; }; then
+		if [ "$(cat "$envdir/$e.attached" 2>/dev/null)" = "$worktree" ] && { ! declare -F envpool_healthy >/dev/null || hook envpool_healthy >&2; }; then
 			echo "envlock: $e already serves $worktree" >&2
 		else
 			# The record is written only after a switch that succeeded; a failing hook exits under set -e before it.
 			rm -f "$envdir/$e.attached"
-			envpool_attach >&2
+			hook envpool_attach >&2
 			printf '%s\n' "$worktree" >"$envdir/$e.attached"
 		fi
 	fi
@@ -304,6 +314,7 @@ acquire() {
 	echo "$worktree ($branch) pane $session pid $!" >"$envdir/$e.holder"
 	exec 9>&-
 	echo "$e"
+	show_info "$e"
 	headroom || shrink_in_background
 }
 
@@ -353,7 +364,9 @@ acquire)
 			declare -F envpool_configure >/dev/null || { echo "envlock: $lease_env lacks ${need[*]} and .envpool has no envpool_configure; run envlock release first" >&2; exit 1; }
 			run_configure "$lease_env" || exit 1
 		fi
-		echo "$lease_env"; exit 0
+		echo "$lease_env"
+		show_info "$lease_env"
+		exit 0
 	fi
 	acquire "$wait"
 	;;
