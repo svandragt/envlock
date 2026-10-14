@@ -58,6 +58,8 @@ Guidance for coding agents working in this repository. `README.md` covers what e
 
 There is no test suite. Test changes in a scratch git repo with a dummy `.envpool` whose hooks only echo, and point `XDG_STATE_HOME` at a scratch directory so the real state under `~/.local/state/envlock` stays untouched.
 
-`acquire` needs a `herdr` on `PATH` and `HERDR_PANE_ID` set. Put a stub `herdr` first on `PATH` whose `agent wait <pane>` blocks until a file named after the pane appears, and create that file to simulate the agent going idle. Never call the real `herdr agent wait` or `herdr agent prompt` from a test. Run several `envlock acquire --wait N` calls in the background, each from its own worktree and pane, to exercise the queue. Never test grow, create, shrink or destroy against real environments.
+`acquire` needs a `herdr` on `PATH` and `HERDR_PANE_ID` set. Put a stub `herdr` first on `PATH` whose `agent wait <pane>` blocks until a file named after the pane appears, and create that file to simulate the agent going idle. Never call the real `herdr agent wait` or `herdr agent prompt` from a test. Run several `envlock acquire --wait N` calls in the background, each from its own worktree and pane, to exercise the queue. Never test grow, create, shrink or destroy against a real project's environments.
+
+To test the hooks for real, use a throwaway sandbox: a scratch git repo with its own devbox, its own seed environment and an untracked `.envpool` whose environments have a prefix no real project uses, such as `sbx`. Never create test tickets, branches or worktrees in a real project.
 
 Check the script with `bash -n bin/envlock` and `shellcheck bin/envlock`; if shellcheck is missing, run it through devbox or `nix shell nixpkgs#shellcheck`.
