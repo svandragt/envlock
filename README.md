@@ -39,7 +39,7 @@ Run these from any worktree of the project:
 | `envlock hold --wait 3600` | Leases an environment and keeps it until you run `envlock release` or close the terminal. Use it for testing that spans several commands. |
 | `envlock release` | Ends this worktree's `hold`. |
 | `envlock status` | Shows which environments are in use and by which ticket, and who is waiting. |
-| `envlock grow` | Adds an environment to the pool now. |
+| `envlock grow` | Adds an environment to the pool now, even past `ENVPOOL_MAX`. |
 
 Without `--wait`, envlock gives up straight away when every environment is busy.
 

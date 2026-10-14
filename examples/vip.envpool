@@ -1,0 +1,53 @@
+# envlock pool for this repo (untracked: see .git/info/exclude).
+# The seed env "site" serves the main checkout and stays out of the pool.
+ENVS=(site2)
+# envlock grows the pool with envpool_create up to ENVPOOL_MAX envs, named ${ENVPOOL_PREFIX}N.
+ENVPOOL_PREFIX=site
+ENVPOOL_MAX=3
+
+# vip is an npm global in the main checkout's devbox; worktree devboxes lack it.
+ENVPOOL_MAIN=$(dirname "$(realpath "${BASH_SOURCE[0]}")")
+vip() { (cd "$ENVPOOL_MAIN" && devbox run -- vip "$@"); }
+
+envpool_attach() {
+	local data="$HOME/.local/share/vip/dev-environment/$ENVLOCK_ENV/instance_data.json"
+	# vip dev-env update rebuilds the containers, so skip it when the env already serves this worktree.
+	if [ "$(jq -r .appCode.dir "$data")" != "$ENVLOCK_WORKTREE" ]; then
+		[ -d "$ENVLOCK_WORKTREE/vendor" ] || viv install -d "$ENVLOCK_WORKTREE"
+		vip dev-env update --slug="$ENVLOCK_ENV" --app-code="$ENVLOCK_WORKTREE"
+		vip dev-env start --slug="$ENVLOCK_ENV" --skip-wp-versions-check
+	fi
+}
+
+envpool_reset() {
+	vip dev-env exec --slug="$ENVLOCK_ENV" --quiet -- wp cache flush --network || true
+}
+
+envpool_exists() { [ -e "$HOME/.local/share/vip/dev-environment/$1" ]; }
+
+envpool_table_count() {
+	docker exec "$1-database-1" mysql -uroot -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='wordpress'"
+}
+
+envpool_tables_match() {
+	local seed new
+	seed=$(envpool_table_count site) && new=$(envpool_table_count "$1") && [ "$seed" -gt 0 ] && [ "$seed" = "$new" ]
+}
+
+envpool_clone_db() {
+	(set -o pipefail; docker exec site-database-1 mysqldump -uroot --single-transaction --quick --routines wordpress | docker exec -i "$1-database-1" mysql -uroot wordpress)
+}
+
+# Clones the seed env site into $ENVLOCK_ENV, so the new env never starts with an empty database.
+# envlock calls this inside an if, where set -e is off, so every step is chained with && and a failure destroys the half-built env.
+envpool_create() {
+	local new=$ENVLOCK_ENV data="$HOME/.local/share/vip/dev-environment/site/instance_data.json" php wp
+	php=$(jq -er '.php | split(":")[-1]' "$data") && wp=$(jq -er .wordpress.tag "$data") &&
+		vip dev-env create --slug="$new" --title="Example site ($new)" --multisite=subdirectory --php="$php" --wordpress="$wp" --mu-plugins=demo --app-code="$ENVPOOL_MAIN" --media-redirect-domain=https://www.example.org --elasticsearch=n --phpmyadmin=n --xdebug=n --mailpit=n --photon=n --cron=n &&
+		vip dev-env start --slug="$new" --skip-wp-versions-check &&
+		envpool_clone_db "$new" &&
+		envpool_tables_match "$new" &&
+		vip dev-env exec --slug="$new" --quiet -- wp search-replace site.vipdev.lndo.site "$new.vipdev.lndo.site" --network --all-tables --precise --report-changed-only --format=count &&
+		vip dev-env exec --slug="$new" --quiet -- wp cache flush --network ||
+		{ echo "envpool_create: $new failed, destroying it" >&2; vip dev-env destroy --slug="$new" || true; return 1; }
+}

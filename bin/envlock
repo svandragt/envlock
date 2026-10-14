@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# Lease one environment from a repo's pool for the lifetime of a command.
+# Config: .envpool at the worktree root, sourced as bash. It sets ENVS=(...)
+# and may define envpool_reset and envpool_attach; both see ENVLOCK_ENV and
+# ENVLOCK_WORKTREE. To let the pool grow it also sets ENVPOOL_PREFIX and
+# ENVPOOL_MAX and defines envpool_create (sees ENVLOCK_ENV, must return
+# non-zero on failure) and optionally envpool_exists NAME.
+set -euo pipefail
+
+usage() {
+	echo "usage: envlock run [--wait SECONDS] -- <command...>" >&2
+	echo "       envlock hold [--wait SECONDS]" >&2
+	echo "       envlock release" >&2
+	echo "       envlock status" >&2
+	echo "       envlock grow" >&2
+	exit 2
+}
+
+worktree=$(git rev-parse --show-toplevel)
+branch=$(git -C "$worktree" branch --show-current)
+# Locks live per repository, not per worktree, so every worktree shares one pool.
+common=$(cd "$worktree" && realpath "$(git rev-parse --git-common-dir)")
+lockdir="${XDG_STATE_HOME:-$HOME/.local/state}/envlock/$(printf '%s' "$common" | sha1sum | cut -c1-12)"
+queue="$lockdir/queue"
+mkdir -p "$queue"
+
+# Fall back to the main checkout, so an untracked .envpool serves every worktree.
+pool="$worktree/.envpool"
+[ -f "$pool" ] || pool="$(dirname "$common")/.envpool"
+[ -f "$pool" ] || { echo "envlock: no .envpool in $worktree or the main checkout" >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$pool"
+[ "${#ENVS[@]}" -gt 0 ] || { echo "envlock: .envpool sets no ENVS" >&2; exit 1; }
+
+# The pool is ENVS plus the envs that growth has added.
+load_envs() {
+	mapfile -t all < <({ printf '%s\n' "${ENVS[@]}"; cat "$lockdir/envs" 2>/dev/null || true; } | awk 'NF && !seen[$0]++')
+}
+
+can_grow() {
+	[ -n "${ENVPOOL_MAX:-}" ] && [ "${#all[@]}" -lt "$ENVPOOL_MAX" ] && declare -F envpool_create >/dev/null
+}
+
+# Prints the live queue entries oldest first and deletes the dead ones.
+# shortcut: kill -0 can match a recycled pid, so a dead waiter's entry may linger; store the process start time if that ever stalls the queue.
+queue_entries() {
+	local f
+	for f in "$queue"/*; do
+		[ -e "$f" ] || continue
+		if kill -0 "${f##*.}" 2>/dev/null; then echo "$f"; else rm -f "$f"; fi
+	done
+}
+
+# Returns 0 when an env was added, 1 when envpool_create failed, 2 when nothing was attempted.
+# With --capped it also refuses to go past ENVPOOL_MAX.
+grow() {
+	local n=2 new
+	# The block closes fd 8 on exit, so envpool_create's leftovers never hold the grow lock.
+	{
+		flock -n 8 || { echo "envlock: another grow is running" >&2; return 2; }
+		load_envs
+		[ "${1:-}" != --capped ] || can_grow || return 2
+		{ declare -F envpool_create >/dev/null && [ -n "${ENVPOOL_PREFIX:-}" ]; } ||
+			{ echo "envlock: .envpool needs ENVPOOL_PREFIX and envpool_create to grow" >&2; return 2; }
+		new=$ENVPOOL_PREFIX$n
+		while [[ " ${all[*]} " == *" $new "* ]] || { declare -F envpool_exists >/dev/null && envpool_exists "$new"; }; do
+			n=$((n + 1))
+			new=$ENVPOOL_PREFIX$n
+		done
+		echo "envlock: creating $new" >&2
+		# Inside an if, set -e is off, so envpool_create has to return non-zero itself.
+		if ENVLOCK_ENV=$new envpool_create >&2; then
+			echo "$new" >>"$lockdir/envs"
+			echo "envlock: added $new" >&2
+		else
+			echo "envlock: creating $new failed, not added" >&2
+			return 1
+		fi
+	} 8>"$lockdir/grow.lock"
+}
+
+# Keeps one env free: when the lease just taken used the last one, grow in the background.
+headroom() {
+	local f
+	load_envs
+	can_grow || return 0
+	for f in "${all[@]}"; do
+		if flock -n "$lockdir/$f.lock" true 2>/dev/null; then return 0; fi
+	done
+	echo "envlock: no free env left, growing in the background (log: $lockdir/grow.log)" >&2
+	# fd 9 is closed for the child so a long grow never holds the lease.
+	setsid "$0" grow --capped 9>&- </dev/null >>"$lockdir/grow.log" 2>&1 &
+}
+
+# Leaves the lease on fd 9 and its env name in $e; exits 75 when none frees up within $1 seconds.
+acquire() {
+	local deadline=$((SECONDS + $1)) grow_failed='' rc q=() mine=() others=()
+	qentry="$queue/$(date +%s%N).$$"
+	echo "$worktree ($branch) pid $$" >"$qentry"
+	# exec keeps the pid, so the success path removes the entry itself.
+	trap 'rm -f "$qentry"' EXIT
+	while :; do
+		mapfile -t q < <(queue_entries)
+		if [ "${q[0]:-}" = "$qentry" ]; then
+			load_envs
+			# An env whose holder file still names this worktree already serves its code, so try it first.
+			mine=() others=()
+			for e in "${all[@]}"; do
+				if [[ $(cat "$lockdir/$e.holder" 2>/dev/null) == "$worktree ("* ]]; then mine+=("$e"); else others+=("$e"); fi
+			done
+			for e in "${mine[@]}" "${others[@]}"; do
+				exec 9>"$lockdir/$e.lock"
+				flock -n 9 && break 2
+				exec 9>&-
+			done
+			# Growing takes minutes, so a fail-fast caller never waits for it.
+			if [ "$1" -gt 0 ] && [ -z "$grow_failed" ] && can_grow; then
+				rc=0
+				grow --capped || rc=$?
+				[ "$rc" -ne 1 ] || grow_failed=1
+				[ "$rc" -ne 0 ] || continue
+			fi
+		fi
+		[ "$SECONDS" -lt "$deadline" ] || { echo "envlock: all environments busy" >&2; exit 75; }
+		sleep 5
+	done
+	rm -f "$qentry"
+	export ENVLOCK_ENV=$e ENVLOCK_WORKTREE=$worktree
+	echo "$worktree ($branch) pid $$" >"$lockdir/$e.holder"
+	echo "envlock: using $e" >&2
+	if declare -F envpool_reset >/dev/null; then envpool_reset; fi
+	if declare -F envpool_attach >/dev/null; then envpool_attach; fi
+	headroom
+}
+
+cmd=${1:-}; shift || true
+case "$cmd" in
+status)
+	load_envs
+	busy=0
+	lines=()
+	for e in "${all[@]}"; do
+		if flock -n "$lockdir/$e.lock" true 2>/dev/null; then
+			lines+=("$e  free")
+		else
+			busy=$((busy + 1))
+			lines+=("$e  held by $(cat "$lockdir/$e.holder" 2>/dev/null || echo unknown)")
+		fi
+	done
+	mapfile -t q < <(queue_entries)
+	echo "$busy/${#all[@]} in use, $((${#all[@]} - busy)) free, ${#q[@]} queued, cap ${ENVPOOL_MAX:-none}"
+	printf '%s\n' "${lines[@]}"
+	for i in "${!q[@]}"; do
+		echo "queued $((i + 1))  $(cat "${q[$i]}" 2>/dev/null || true)"
+	done
+	;;
+run | hold)
+	wait=0
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--wait) wait=$2; shift 2 ;;
+		--) shift; break ;;
+		*) usage ;;
+		esac
+	done
+	if [ "$cmd" = run ]; then [ $# -gt 0 ] || usage; else [ $# -eq 0 ] || usage; fi
+	acquire "$wait"
+	# exec keeps fd 9 open, so the lock lasts exactly as long as the command.
+	if [ "$cmd" = run ]; then exec "$@"; fi
+	echo "$e"
+	exec sleep infinity
+	;;
+release)
+	load_envs
+	found=''
+	for e in "${all[@]}"; do
+		holder=$(cat "$lockdir/$e.holder" 2>/dev/null) || continue
+		[[ $holder == "$worktree ("* ]] || continue
+		pid=${holder##* pid }
+		# Holder files outlive their lease, so only kill a pid that still has this env's lock open.
+		[ "$(readlink "/proc/$pid/fd/9" 2>/dev/null)" = "$lockdir/$e.lock" ] || continue
+		kill "$pid"
+		echo "envlock: released $e (pid $pid)"
+		found=1
+	done
+	[ -n "$found" ] || echo "envlock: no lease held by $worktree"
+	;;
+grow)
+	grow "${1:-}"
+	;;
+*) usage ;;
+esac
