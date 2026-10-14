@@ -8,10 +8,15 @@
 # ENVPOOL_MAX and defines envpool_create (sees ENVLOCK_ENV, must return
 # non-zero on failure) and optionally envpool_exists NAME. To let it shrink
 # again it defines envpool_destroy (same contract as envpool_create).
+# envpool_describe (sees ENVLOCK_ENV) prints the env's attributes as space-separated
+# key=value pairs. With it, acquire --need key=value leases an env that has them and
+# acquire --want key=value only prefers an env that has them.
+# envpool_configure key=value... (sees ENVLOCK_ENV, same contract as
+# envpool_create) changes an env that lacks a needed pair, before reset and attach.
 set -euo pipefail
 
 usage() {
-	echo "usage: envlock acquire [--wait SECONDS]" >&2
+	echo "usage: envlock acquire [--wait SECONDS] [--need KEY=VALUE]... [--want KEY=VALUE]..." >&2
 	echo "       envlock env" >&2
 	echo "       envlock release" >&2
 	echo "       envlock status" >&2
@@ -55,6 +60,34 @@ source "$pool"
 # The pool is ENVS plus the envs that growth has added.
 load_envs() {
 	mapfile -t all < <({ printf '%s\n' "${ENVS[@]}"; cat "$lockdir/envs" 2>/dev/null || true; } | awk 'NF && !seen[$0]++')
+}
+
+# Prints env $1's attributes; prints nothing when envpool_describe is missing or fails.
+describe() {
+	local out
+	if declare -F envpool_describe >/dev/null && out=$(ENVLOCK_ENV=$1 envpool_describe); then printf '%s\n' "$out"; fi
+}
+
+# Succeeds when the attribute string $1 contains every pair after it.
+has_all() {
+	local attrs=$1 pair
+	shift
+	for pair in "$@"; do [[ " $attrs " == *" $pair "* ]] || return 1; done
+}
+
+# Succeeds when env $1 has every --need pair; with no --need every env does.
+needs_met() {
+	[ "${#need[@]}" -eq 0 ] || has_all "$(describe "$1")" "${need[@]}"
+}
+
+# Runs envpool_configure on env $1 for the needed pairs. After a failure the env is in an unknown state, so the attach record goes.
+run_configure() {
+	echo "envlock: configuring $1 for ${need[*]}" >&2
+	if ! ENVLOCK_ENV=$1 ENVLOCK_WORKTREE=$worktree envpool_configure "${need[@]}" >&2; then
+		rm -f "$envdir/$1.attached"
+		echo "envlock: configuring $1 failed" >&2
+		return 1
+	fi
 }
 
 can_grow() {
@@ -188,9 +221,30 @@ find_lease() {
 	return 1
 }
 
+# Prints the pool in the order acquire tries it: envs with the needed attributes before the rest, then envs with the wanted ones, then envs whose holder names this worktree.
+# Without envpool_configure an env that lacks a needed pair is left out.
+try_order() {
+	local e r attrs n w h
+	local -A tier
+	for e in "${all[@]}"; do
+		attrs='' n=0 w=0 h=0
+		[ $((${#need[@]} + ${#want[@]})) -eq 0 ] || attrs=$(describe "$e")
+		has_all "$attrs" "${need[@]}" || n=4
+		has_all "$attrs" "${want[@]}" || w=2
+		[[ $(cat "$envdir/$e.holder" 2>/dev/null) == "$worktree ("* ]] || h=1
+		tier[$e]=$((n + w + h))
+	done
+	for r in 0 1 2 3 4 5 6 7; do
+		if [ "$r" -ge 4 ] && ! declare -F envpool_configure >/dev/null; then break; fi
+		for e in "${all[@]}"; do
+			if [ "${tier[$e]}" = "$r" ]; then echo "$e"; fi
+		done
+	done
+}
+
 # Leaves the lease on fd 9 and its env name in $e; exits 75 when none frees up within $1 seconds.
 acquire() {
-	local deadline=$((SECONDS + $1)) grow_failed='' rc q=() mine=() others=()
+	local deadline=$((SECONDS + $1)) grow_failed='' mismatch='' rc q=() order=()
 	qentry="$queue/$(date +%s%N).$$"
 	echo "$worktree ($branch) pid $$" >"$qentry"
 	trap 'rm -f "$qentry"' EXIT
@@ -198,17 +252,19 @@ acquire() {
 		mapfile -t q < <(queue_entries)
 		if [ "${q[0]:-}" = "$qentry" ]; then
 			load_envs
-			# An env whose holder file still names this worktree already serves its code, so try it first.
-			mine=() others=()
-			for e in "${all[@]}"; do
-				if [[ $(cat "$envdir/$e.holder" 2>/dev/null) == "$worktree ("* ]]; then mine+=("$e"); else others+=("$e"); fi
-			done
-			for e in "${mine[@]}" "${others[@]}"; do
+			# An env whose holder file still names this worktree already serves its code, so it ranks first.
+			mapfile -t order < <(try_order)
+			for e in "${order[@]}"; do
 				exec 9>"$envdir/$e.lock"
 				if flock -n 9; then
 					# A shrink drops a name from the pool while it holds the lock, so a name that is gone is not leasable.
 					load_envs
-					if [[ " ${all[*]} " == *" $e "* ]]; then break 2; fi
+					if [[ " ${all[*]} " == *" $e "* ]]; then
+						# The env may have changed since it was ranked, so the needs are checked again under the lock.
+						mismatch=''
+						needs_met "$e" || mismatch=1
+						if [ -z "$mismatch" ] || declare -F envpool_configure >/dev/null; then break 2; fi
+					fi
 				fi
 				exec 9>&-
 			done
@@ -220,7 +276,7 @@ acquire() {
 				[ "$rc" -ne 0 ] || continue
 			fi
 		fi
-		[ "$SECONDS" -lt "$deadline" ] || { echo "envlock: all environments busy" >&2; exit 75; }
+		[ "$SECONDS" -lt "$deadline" ] || { echo "envlock: all environments busy${need[*]:+ or lacking ${need[*]}}" >&2; exit 75; }
 		sleep 5
 	done
 	rm -f "$qentry"
@@ -230,6 +286,7 @@ acquire() {
 	# Written through a dot file and mv, so a shrink never reads half a record.
 	printf '%s\n%s\n' "$worktree" "$e" >"$last/.$$" && mv "$last/.$$" "$last/$(printf '%s' "$worktree" | sha1sum | cut -c1-40)"
 	echo "envlock: using $e" >&2
+	[ -z "$mismatch" ] || run_configure "$e" || exit 1
 	# Hook output goes to stderr, so stdout carries only the env name.
 	if declare -F envpool_reset >/dev/null; then envpool_reset >&2; fi
 	if declare -F envpool_attach >/dev/null; then
@@ -257,11 +314,12 @@ status)
 	busy=0
 	lines=()
 	for e in "${all[@]}"; do
+		attrs=$(describe "$e")
 		if flock -n "$envdir/$e.lock" true 2>/dev/null; then
-			lines+=("$e  free")
+			lines+=("$e  free${attrs:+  $attrs}")
 		else
 			busy=$((busy + 1))
-			lines+=("$e  held by $(cat "$envdir/$e.holder" 2>/dev/null || echo unknown)")
+			lines+=("$e  held by $(cat "$envdir/$e.holder" 2>/dev/null || echo unknown)${attrs:+  $attrs}")
 		fi
 	done
 	mapfile -t q < <(queue_entries)
@@ -273,14 +331,30 @@ status)
 	;;
 acquire)
 	wait=0
+	need=() want=()
 	while [ $# -gt 0 ]; do
 		case "$1" in
 		--wait) wait=$2; shift 2 ;;
+		--need | --want)
+			[[ ${2:-} == ?*=?* ]] || { echo "envlock: $1 needs key=value" >&2; exit 2; }
+			if [ "$1" = --need ]; then need+=("$2"); else want+=("$2"); fi
+			shift 2 ;;
 		*) usage ;;
 		esac
 	done
+	if ! declare -F envpool_describe >/dev/null; then
+		[ "${#need[@]}" -eq 0 ] || { echo "envlock: --need requires envpool_describe in .envpool" >&2; exit 1; }
+		[ "${#want[@]}" -eq 0 ] || echo "envlock: ignoring --want, .envpool has no envpool_describe" >&2
+		want=()
+	fi
 	session=$(session_id) || exit 1
-	if find_lease; then echo "$lease_env"; exit 0; fi
+	if find_lease; then
+		if ! needs_met "$lease_env"; then
+			declare -F envpool_configure >/dev/null || { echo "envlock: $lease_env lacks ${need[*]} and .envpool has no envpool_configure; run envlock release first" >&2; exit 1; }
+			run_configure "$lease_env" || exit 1
+		fi
+		echo "$lease_env"; exit 0
+	fi
 	acquire "$wait"
 	;;
 env)

@@ -24,6 +24,27 @@ envpool_reset() {
 
 envpool_exists() { [ -e "$HOME/.local/share/vip/dev-environment/$1" ]; }
 
+# Prints the attributes envlock matches --need and --want against, for example: wp=7.1 php=8.4
+envpool_describe() {
+	jq -er '"wp=\(.wordpress.tag) php=\(.php | split(":")[-1])"' "$HOME/.local/share/vip/dev-environment/$ENVLOCK_ENV/instance_data.json"
+}
+
+# Changes $ENVLOCK_ENV to the wanted versions, for example: envpool_configure wp=6.9 php=8.3
+# Clones copy the seed's database, so an older WordPress version runs on a newer database schema.
+# envlock calls this inside an if, where set -e is off, so the steps are chained with &&.
+envpool_configure() {
+	local flags=() pair
+	for pair in "$@"; do
+		case $pair in
+		wp=*) flags+=(--wordpress="${pair#wp=}") ;;
+		php=*) flags+=(--php="${pair#php=}") ;;
+		*) echo "envpool_configure: unknown attribute $pair" >&2; return 1 ;;
+		esac
+	done
+	vip dev-env update --slug="$ENVLOCK_ENV" "${flags[@]}" &&
+		vip dev-env start --slug="$ENVLOCK_ENV" --skip-wp-versions-check
+}
+
 envpool_table_count() {
 	docker exec "$1-database-1" mysql -uroot -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='wordpress'"
 }
