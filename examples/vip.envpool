@@ -9,15 +9,14 @@ ENVPOOL_MAX=3
 ENVPOOL_MAIN=$(dirname "$(realpath "${BASH_SOURCE[0]}")")
 vip() { (cd "$ENVPOOL_MAIN" && devbox run -- vip "$@"); }
 
+# envlock records a successful switch and skips this while the record names the worktree and envpool_healthy passes.
 envpool_attach() {
-	local data="$HOME/.local/share/vip/dev-environment/$ENVLOCK_ENV/instance_data.json"
-	# vip dev-env update rebuilds the containers, so skip it when the env already serves this worktree.
-	if [ "$(jq -r .appCode.dir "$data")" != "$ENVLOCK_WORKTREE" ]; then
-		[ -d "$ENVLOCK_WORKTREE/vendor" ] || viv install -d "$ENVLOCK_WORKTREE"
-		vip dev-env update --slug="$ENVLOCK_ENV" --app-code="$ENVLOCK_WORKTREE"
-		vip dev-env start --slug="$ENVLOCK_ENV" --skip-wp-versions-check
-	fi
+	[ -d "$ENVLOCK_WORKTREE/vendor" ] || viv install -d "$ENVLOCK_WORKTREE"
+	vip dev-env update --slug="$ENVLOCK_ENV" --app-code="$ENVLOCK_WORKTREE"
+	vip dev-env start --slug="$ENVLOCK_ENV" --skip-wp-versions-check
 }
+
+envpool_healthy() { [ "$(docker inspect -f '{{.State.Running}}' "$ENVLOCK_ENV-php-1" 2>/dev/null)" = true ]; }
 
 envpool_reset() {
 	vip dev-env exec --slug="$ENVLOCK_ENV" --quiet -- wp cache flush --network || true

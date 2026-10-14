@@ -33,6 +33,8 @@ If the file is missing, stop and tell the user that the repo needs an untracked
   environment that serves the main checkout.
 - `envpool_attach`: points `$ENVLOCK_ENV` at `$ENVLOCK_WORKTREE`.
 - `envpool_reset`: clears state in `$ENVLOCK_ENV` between leases.
+- Optional: `envpool_healthy`, which succeeds when `$ENVLOCK_ENV` already serves
+  its code, so envlock can skip `envpool_attach`.
 - Optional, to let the pool grow: `ENVPOOL_PREFIX`, `ENVPOOL_MAX`,
   `envpool_create` and `envpool_exists`.
 
@@ -59,13 +61,13 @@ If the file is missing, stop and tell the user that the repo needs an untracked
    not accepted, use the name that `herdr agent list` shows for the pane. The brief says:
 
    - Your ticket is `<ticket>`. Read the ticket first, then work on it in this worktree.
-   - To run a one-off command that needs the environment, use
-     `envlock run --wait 3600 -- <cmd>`.
-   - For testing in several steps, open a new herdr pane that runs
-     `envlock hold --wait 3600`. It prints the environment name once it holds the
-     lease. Run `envlock release` when testing is done.
+   - Before anything that needs the environment, run `envlock acquire --wait 3600`.
+     It prints the environment name, and `envlock env` prints it again.
+   - The lease ends by itself when you finish your turn, so run
+     `envlock acquire --wait 3600` again in the next turn that needs the environment.
+   - `envlock release` ends the lease early.
    - Never use the seed environment or another session's environment directly.
-   - `envlock status` shows which worktree holds which environment and who is queued.
+   - `envlock status` shows who holds which environment and who is queued.
 
 ## Finish
 

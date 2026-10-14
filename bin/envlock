@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
-# Lease one environment from a repo's pool for the lifetime of a command.
+# Lease one environment from a repo's pool for as long as an agent session is busy.
 # Config: .envpool at the worktree root, sourced as bash. It sets ENVS=(...)
 # and may define envpool_reset and envpool_attach; both see ENVLOCK_ENV and
-# ENVLOCK_WORKTREE. To let the pool grow it also sets ENVPOOL_PREFIX and
+# ENVLOCK_WORKTREE. It may also define envpool_healthy (sees ENVLOCK_ENV),
+# which lets envlock skip envpool_attach when the env already serves the
+# worktree. To let the pool grow it also sets ENVPOOL_PREFIX and
 # ENVPOOL_MAX and defines envpool_create (sees ENVLOCK_ENV, must return
 # non-zero on failure) and optionally envpool_exists NAME. To let it shrink
 # again it defines envpool_destroy (same contract as envpool_create).
 set -euo pipefail
 
 usage() {
-	echo "usage: envlock run [--wait SECONDS] -- <command...>" >&2
-	echo "       envlock hold [--wait SECONDS]" >&2
+	echo "usage: envlock acquire [--wait SECONDS]" >&2
+	echo "       envlock env" >&2
 	echo "       envlock release" >&2
 	echo "       envlock status" >&2
 	echo "       envlock grow" >&2
@@ -18,15 +20,29 @@ usage() {
 	exit 2
 }
 
+# These two functions are the only herdr-specific code.
+# Prints the id of the calling agent session; fails with a message when there is none.
+session_id() {
+	[ -n "${HERDR_PANE_ID:-}" ] || { echo "envlock: HERDR_PANE_ID is not set; run acquire from a herdr pane" >&2; return 1; }
+	command -v herdr >/dev/null || { echo "envlock: herdr is not on PATH" >&2; return 1; }
+	echo "$HERDR_PANE_ID"
+}
+
+# Blocks until session $1 is idle, done or gone. It execs, so call it in a process of its own: that process becomes the waiter, and killing it ends the wait.
+session_wait_idle() { exec herdr agent wait "$1" --until idle --until 'done'; }
+
 worktree=$(git rev-parse --show-toplevel)
 branch=$(git -C "$worktree" branch --show-current)
 # Locks live per repository, not per worktree, so every worktree shares one pool.
 common=$(cd "$worktree" && realpath "$(git rev-parse --git-common-dir)")
-lockdir="${XDG_STATE_HOME:-$HOME/.local/state}/envlock/$(printf '%s' "$common" | sha1sum | cut -c1-12)"
+state="${XDG_STATE_HOME:-$HOME/.local/state}/envlock"
+lockdir="$state/$(printf '%s' "$common" | sha1sum | cut -c1-12)"
+# Each env's .lock, .holder and .attached files live here, outside the per-repo directory, so repos that list the same env share one lock.
+envdir="$state/envs"
 queue="$lockdir/queue"
 # One record per worktree: its path on line 1 and the env it leased last on line 2.
 last="$lockdir/last"
-mkdir -p "$queue" "$last"
+mkdir -p "$queue" "$last" "$envdir"
 
 # Fall back to the main checkout, so an untracked .envpool serves every worktree.
 pool="$worktree/.envpool"
@@ -90,7 +106,7 @@ headroom() {
 	load_envs
 	can_grow || return 1
 	for f in "${all[@]}"; do
-		if flock -n "$lockdir/$f.lock" true 2>/dev/null; then return 1; fi
+		if flock -n "$envdir/$f.lock" true 2>/dev/null; then return 1; fi
 	done
 	echo "envlock: no free env left, growing in the background (log: $lockdir/grow.log)" >&2
 	# fd 9 is closed for the child so a long grow never holds the lease.
@@ -113,7 +129,7 @@ other_free() {
 	local f
 	for f in "${all[@]}"; do
 		[ "$f" != "$1" ] || continue
-		if flock -n "$lockdir/$f.lock" true 2>/dev/null; then return 0; fi
+		if flock -n "$envdir/$f.lock" true 2>/dev/null; then return 0; fi
 	done
 	return 1
 }
@@ -130,7 +146,7 @@ shrink() {
 		for e in "${grown[@]}"; do
 			[[ " ${ENVS[*]} " != *" $e "* ]] || continue
 			{
-				# Holding the lease lock stops anyone leasing $e while it is destroyed.
+				# Holding the lease lock stops anyone leasing $e while it is destroyed. The lock file is never deleted: a lease that races with the removal still locks the same inode, then finds the name gone.
 				flock -n 7 || continue
 				load_envs
 				if env_in_use "$e" || ! other_free "$e"; then continue; fi
@@ -138,13 +154,13 @@ shrink() {
 				# Inside an if, set -e is off, so envpool_destroy has to return non-zero itself.
 				if ENVLOCK_ENV=$e envpool_destroy >&2; then
 					awk -v e="$e" '$0 != e' "$lockdir/envs" >"$lockdir/envs.tmp" && mv "$lockdir/envs.tmp" "$lockdir/envs"
-					rm -f "$lockdir/$e".{lock,holder}
+					rm -f "$envdir/$e".{holder,attached}
 					echo "envlock: removed $e" >&2
 					removed=1
 				else
 					echo "envlock: destroying $e failed, kept" >&2
 				fi
-			} 7>"$lockdir/$e.lock"
+			} 7>"$envdir/$e.lock"
 		done
 	} 8>"$lockdir/grow.lock"
 	# A lease may have taken the last free env during the destroy, when its own headroom could not grow.
@@ -158,12 +174,25 @@ shrink_in_background() {
 	fi
 }
 
+# Sets lease_env and lease_pid when this worktree holds a live lease.
+find_lease() {
+	local holder
+	load_envs
+	for lease_env in "${all[@]}"; do
+		holder=$(cat "$envdir/$lease_env.holder" 2>/dev/null) || continue
+		[[ $holder == "$worktree ("* ]] || continue
+		lease_pid=${holder##* pid }
+		# Holder files outlive their lease, so only trust a pid that still has this env's lock open.
+		[ "$(readlink "/proc/$lease_pid/fd/9" 2>/dev/null)" = "$envdir/$lease_env.lock" ] && return 0
+	done
+	return 1
+}
+
 # Leaves the lease on fd 9 and its env name in $e; exits 75 when none frees up within $1 seconds.
 acquire() {
 	local deadline=$((SECONDS + $1)) grow_failed='' rc q=() mine=() others=()
 	qentry="$queue/$(date +%s%N).$$"
 	echo "$worktree ($branch) pid $$" >"$qentry"
-	# exec keeps the pid, so the success path removes the entry itself.
 	trap 'rm -f "$qentry"' EXIT
 	while :; do
 		mapfile -t q < <(queue_entries)
@@ -172,11 +201,15 @@ acquire() {
 			# An env whose holder file still names this worktree already serves its code, so try it first.
 			mine=() others=()
 			for e in "${all[@]}"; do
-				if [[ $(cat "$lockdir/$e.holder" 2>/dev/null) == "$worktree ("* ]]; then mine+=("$e"); else others+=("$e"); fi
+				if [[ $(cat "$envdir/$e.holder" 2>/dev/null) == "$worktree ("* ]]; then mine+=("$e"); else others+=("$e"); fi
 			done
 			for e in "${mine[@]}" "${others[@]}"; do
-				exec 9>"$lockdir/$e.lock"
-				flock -n 9 && break 2
+				exec 9>"$envdir/$e.lock"
+				if flock -n 9; then
+					# A shrink drops a name from the pool while it holds the lock, so a name that is gone is not leasable.
+					load_envs
+					if [[ " ${all[*]} " == *" $e "* ]]; then break 2; fi
+				fi
 				exec 9>&-
 			done
 			# Growing takes minutes, so a fail-fast caller never waits for it.
@@ -192,12 +225,28 @@ acquire() {
 	done
 	rm -f "$qentry"
 	export ENVLOCK_ENV=$e ENVLOCK_WORKTREE=$worktree
-	echo "$worktree ($branch) pid $$" >"$lockdir/$e.holder"
+	# No pid yet, so find_lease ignores this record until the holder runs.
+	echo "$worktree ($branch) pane $session" >"$envdir/$e.holder"
 	# Written through a dot file and mv, so a shrink never reads half a record.
 	printf '%s\n%s\n' "$worktree" "$e" >"$last/.$$" && mv "$last/.$$" "$last/$(printf '%s' "$worktree" | sha1sum | cut -c1-40)"
 	echo "envlock: using $e" >&2
-	if declare -F envpool_reset >/dev/null; then envpool_reset; fi
-	if declare -F envpool_attach >/dev/null; then envpool_attach; fi
+	# Hook output goes to stderr, so stdout carries only the env name.
+	if declare -F envpool_reset >/dev/null; then envpool_reset >&2; fi
+	if declare -F envpool_attach >/dev/null; then
+		if [ "$(cat "$envdir/$e.attached" 2>/dev/null)" = "$worktree" ] && { ! declare -F envpool_healthy >/dev/null || envpool_healthy >&2; }; then
+			echo "envlock: $e already serves $worktree" >&2
+		else
+			# The record is written only after a switch that succeeded; a failing hook exits under set -e before it.
+			rm -f "$envdir/$e.attached"
+			envpool_attach >&2
+			printf '%s\n' "$worktree" >"$envdir/$e.attached"
+		fi
+	fi
+	# The holder inherits fd 9 and keeps the lease until the session is idle or done, or the wait fails.
+	setsid bash -c "$(declare -f session_wait_idle); session_wait_idle \"\$1\"" _ "$session" </dev/null >>"$lockdir/holder.log" 2>&1 &
+	echo "$worktree ($branch) pane $session pid $!" >"$envdir/$e.holder"
+	exec 9>&-
+	echo "$e"
 	headroom || shrink_in_background
 }
 
@@ -208,11 +257,11 @@ status)
 	busy=0
 	lines=()
 	for e in "${all[@]}"; do
-		if flock -n "$lockdir/$e.lock" true 2>/dev/null; then
+		if flock -n "$envdir/$e.lock" true 2>/dev/null; then
 			lines+=("$e  free")
 		else
 			busy=$((busy + 1))
-			lines+=("$e  held by $(cat "$lockdir/$e.holder" 2>/dev/null || echo unknown)")
+			lines+=("$e  held by $(cat "$envdir/$e.holder" 2>/dev/null || echo unknown)")
 		fi
 	done
 	mapfile -t q < <(queue_entries)
@@ -222,36 +271,26 @@ status)
 		echo "queued $((i + 1))  $(cat "${q[$i]}" 2>/dev/null || true)"
 	done
 	;;
-run | hold)
+acquire)
 	wait=0
 	while [ $# -gt 0 ]; do
 		case "$1" in
 		--wait) wait=$2; shift 2 ;;
-		--) shift; break ;;
 		*) usage ;;
 		esac
 	done
-	if [ "$cmd" = run ]; then [ $# -gt 0 ] || usage; else [ $# -eq 0 ] || usage; fi
+	session=$(session_id) || exit 1
+	if find_lease; then echo "$lease_env"; exit 0; fi
 	acquire "$wait"
-	# exec keeps fd 9 open, so the lock lasts exactly as long as the command.
-	if [ "$cmd" = run ]; then exec "$@"; fi
-	echo "$e"
-	exec sleep infinity
+	;;
+env)
+	find_lease || exit 1
+	echo "$lease_env"
 	;;
 release)
-	load_envs
-	found=''
-	for e in "${all[@]}"; do
-		holder=$(cat "$lockdir/$e.holder" 2>/dev/null) || continue
-		[[ $holder == "$worktree ("* ]] || continue
-		pid=${holder##* pid }
-		# Holder files outlive their lease, so only kill a pid that still has this env's lock open.
-		[ "$(readlink "/proc/$pid/fd/9" 2>/dev/null)" = "$lockdir/$e.lock" ] || continue
-		kill "$pid"
-		echo "envlock: released $e (pid $pid)"
-		found=1
-	done
-	[ -n "$found" ] || echo "envlock: no lease held by $worktree"
+	find_lease || { echo "envlock: no lease held by $worktree"; exit 0; }
+	kill "$lease_pid"
+	echo "envlock: released $lease_env (pid $lease_pid)"
 	;;
 grow)
 	grow "${1:-}"
