@@ -38,6 +38,9 @@ envpool_clone_db() {
 	(set -o pipefail; docker exec site-database-1 mysqldump -uroot --single-transaction --quick --routines wordpress | docker exec -i "$1-database-1" mysql -uroot wordpress)
 }
 
+# envlock calls this for grown envs only, when no live worktree uses them and another env is free.
+envpool_destroy() { vip dev-env destroy --slug="$ENVLOCK_ENV"; }
+
 # Clones the seed env site into $ENVLOCK_ENV, so the new env never starts with an empty database.
 # envlock calls this inside an if, where set -e is off, so every step is chained with && and a failure destroys the half-built env.
 envpool_create() {

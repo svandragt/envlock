@@ -4,7 +4,8 @@
 # and may define envpool_reset and envpool_attach; both see ENVLOCK_ENV and
 # ENVLOCK_WORKTREE. To let the pool grow it also sets ENVPOOL_PREFIX and
 # ENVPOOL_MAX and defines envpool_create (sees ENVLOCK_ENV, must return
-# non-zero on failure) and optionally envpool_exists NAME.
+# non-zero on failure) and optionally envpool_exists NAME. To let it shrink
+# again it defines envpool_destroy (same contract as envpool_create).
 set -euo pipefail
 
 usage() {
@@ -13,6 +14,7 @@ usage() {
 	echo "       envlock release" >&2
 	echo "       envlock status" >&2
 	echo "       envlock grow" >&2
+	echo "       envlock shrink" >&2
 	exit 2
 }
 
@@ -22,7 +24,9 @@ branch=$(git -C "$worktree" branch --show-current)
 common=$(cd "$worktree" && realpath "$(git rev-parse --git-common-dir)")
 lockdir="${XDG_STATE_HOME:-$HOME/.local/state}/envlock/$(printf '%s' "$common" | sha1sum | cut -c1-12)"
 queue="$lockdir/queue"
-mkdir -p "$queue"
+# One record per worktree: its path on line 1 and the env it leased last on line 2.
+last="$lockdir/last"
+mkdir -p "$queue" "$last"
 
 # Fall back to the main checkout, so an untracked .envpool serves every worktree.
 pool="$worktree/.envpool"
@@ -80,16 +84,78 @@ grow() {
 }
 
 # Keeps one env free: when the lease just taken used the last one, grow in the background.
+# Returns 0 when it started a grow, 1 when it did not.
 headroom() {
 	local f
 	load_envs
-	can_grow || return 0
+	can_grow || return 1
 	for f in "${all[@]}"; do
-		if flock -n "$lockdir/$f.lock" true 2>/dev/null; then return 0; fi
+		if flock -n "$lockdir/$f.lock" true 2>/dev/null; then return 1; fi
 	done
 	echo "envlock: no free env left, growing in the background (log: $lockdir/grow.log)" >&2
 	# fd 9 is closed for the child so a long grow never holds the lease.
 	setsid "$0" grow --capped 9>&- </dev/null >>"$lockdir/grow.log" 2>&1 &
+}
+
+# Succeeds when a worktree that still exists last leased env $1. Deletes the records of worktrees that are gone.
+env_in_use() {
+	local f wt name used=1
+	for f in "$last"/*; do
+		[ -e "$f" ] || continue
+		{ IFS= read -r wt && IFS= read -r name; } <"$f" || true
+		if [ -d "$wt" ]; then [ "$name" != "$1" ] || used=0; else rm -f "$f"; fi
+	done
+	return "$used"
+}
+
+# Succeeds when an env other than $1 is free right now.
+other_free() {
+	local f
+	for f in "${all[@]}"; do
+		[ "$f" != "$1" ] || continue
+		if flock -n "$lockdir/$f.lock" true 2>/dev/null; then return 0; fi
+	done
+	return 1
+}
+
+# Removes envs that growth added once no live worktree uses them, as long as another env stays free.
+# Returns 0 when it ran, 2 when it could not start.
+shrink() {
+	local e grown removed=''
+	declare -F envpool_destroy >/dev/null || { echo "envlock: .envpool needs envpool_destroy to shrink" >&2; return 2; }
+	# Fd 8 is the pool lock, fd 7 the candidate's lease lock. The blocks close them on exit, so envpool_destroy's leftovers never hold either.
+	{
+		flock -n 8 || { echo "envlock: a grow or shrink is running" >&2; return 2; }
+		mapfile -t grown < <(awk 'NF && !seen[$0]++' "$lockdir/envs" 2>/dev/null)
+		for e in "${grown[@]}"; do
+			[[ " ${ENVS[*]} " != *" $e "* ]] || continue
+			{
+				# Holding the lease lock stops anyone leasing $e while it is destroyed.
+				flock -n 7 || continue
+				load_envs
+				if env_in_use "$e" || ! other_free "$e"; then continue; fi
+				echo "envlock: destroying $e" >&2
+				# Inside an if, set -e is off, so envpool_destroy has to return non-zero itself.
+				if ENVLOCK_ENV=$e envpool_destroy >&2; then
+					awk -v e="$e" '$0 != e' "$lockdir/envs" >"$lockdir/envs.tmp" && mv "$lockdir/envs.tmp" "$lockdir/envs"
+					rm -f "$lockdir/$e".{lock,holder}
+					echo "envlock: removed $e" >&2
+					removed=1
+				else
+					echo "envlock: destroying $e failed, kept" >&2
+				fi
+			} 7>"$lockdir/$e.lock"
+		done
+	} 8>"$lockdir/grow.lock"
+	# A lease may have taken the last free env during the destroy, when its own headroom could not grow.
+	[ -z "$removed" ] || headroom || true
+}
+
+# Starts a shrink in the background when growth has added envs and envpool_destroy can remove them.
+shrink_in_background() {
+	if declare -F envpool_destroy >/dev/null && [ -s "$lockdir/envs" ]; then
+		setsid "$0" shrink 9>&- </dev/null >>"$lockdir/grow.log" 2>&1 &
+	fi
 }
 
 # Leaves the lease on fd 9 and its env name in $e; exits 75 when none frees up within $1 seconds.
@@ -127,10 +193,12 @@ acquire() {
 	rm -f "$qentry"
 	export ENVLOCK_ENV=$e ENVLOCK_WORKTREE=$worktree
 	echo "$worktree ($branch) pid $$" >"$lockdir/$e.holder"
+	# Written through a dot file and mv, so a shrink never reads half a record.
+	printf '%s\n%s\n' "$worktree" "$e" >"$last/.$$" && mv "$last/.$$" "$last/$(printf '%s' "$worktree" | sha1sum | cut -c1-40)"
 	echo "envlock: using $e" >&2
 	if declare -F envpool_reset >/dev/null; then envpool_reset; fi
 	if declare -F envpool_attach >/dev/null; then envpool_attach; fi
-	headroom
+	headroom || shrink_in_background
 }
 
 cmd=${1:-}; shift || true
@@ -187,6 +255,9 @@ release)
 	;;
 grow)
 	grow "${1:-}"
+	;;
+shrink)
+	shrink
 	;;
 *) usage ;;
 esac

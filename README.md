@@ -25,6 +25,7 @@ ENVPOOL_MAX=3                # never grow the pool past this
 envpool_attach() { ...; }    # point $ENVLOCK_ENV at the code in $ENVLOCK_WORKTREE
 envpool_reset() { ...; }     # clean up before each lease, for example flush caches
 envpool_create() { ...; }    # build $ENVLOCK_ENV, including its database; return non-zero on failure
+envpool_destroy() { ...; }   # remove $ENVLOCK_ENV; return non-zero on failure. Without it the pool never shrinks
 ```
 
 Only `ENVS` is required. Leave out `ENVPOOL_MAX` and `envpool_create` to keep the pool a fixed size. [`examples/vip.envpool`](examples/vip.envpool) is a complete example for VIP dev-env sites.
@@ -40,10 +41,11 @@ Run these from any worktree of the project:
 | `envlock release` | Ends this worktree's `hold`. |
 | `envlock status` | Shows which environments are in use and by which ticket, and who is waiting. |
 | `envlock grow` | Adds an environment to the pool now, even past `ENVPOOL_MAX`. |
+| `envlock shrink` | Removes the environments envlock added that no unfinished ticket uses, now. At least one environment stays free. |
 
 Without `--wait`, envlock gives up straight away when every environment is busy.
 
-When a lease takes the last free environment, envlock builds another one in the background, up to `ENVPOOL_MAX`, so the next ticket does not wait for it.
+When a lease takes the last free environment, envlock builds another one in the background, up to `ENVPOOL_MAX`, so the next ticket does not wait for it. After each lease, envlock also removes an environment it added earlier when no existing worktree has it as its most recent lease and another environment is free. Environments in `ENVS` are never removed.
 
 ## Start a session per ticket
 
