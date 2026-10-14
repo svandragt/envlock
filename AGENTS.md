@@ -6,7 +6,7 @@ Guidance for coding agents working in this repository. `README.md` covers what e
 
 - `bin/envlock`: the whole tool, one bash script. `~/.local/bin/envlock` is a symlink to it.
 - `skills/ticket-fleet/SKILL.md`: a Claude Code skill that starts a herdr worktree and session per ticket. `~/.claude/skills/ticket-fleet` is a symlink to it.
-- `examples/vip.envpool`: a copy of a real pool config for VIP dev-env sites. The real file lives untracked in that project's main checkout.
+- `examples/vip.envpool`: an anonymised copy of a real pool config for VIP dev-env sites. The real file lives untracked in that project's main checkout.
 
 ## How a lease works
 

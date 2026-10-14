@@ -58,6 +58,63 @@ Use `--want` when a version is preferred but any will do. It only changes which 
 
 When a lease takes the last free environment, envlock builds another one in the background, up to `ENVPOOL_MAX`, so the next ticket does not wait for it. After each lease, envlock also removes an environment it added earlier when no existing worktree has it as its most recent lease and another environment is free. Environments in `ENVS` are never removed.
 
+## Examples
+
+These examples use a VIP dev-env project whose pool has two environments, `site2` and `site3`. `site` is the seed, which serves the main checkout.
+
+### See the pool
+
+```console
+$ envlock status
+1/2 in use, 1 free, 0 queued, cap 3
+site2  held by ~/worktrees/my-project/ABC-101 (ABC-101-fix-menu) pane w3:p1 pid 41872  wp=6.9 php=8.2
+site3  free  wp=7.1 php=8.4
+```
+
+### Run a check against the site
+
+An agent leases an environment, then uses its name:
+
+```bash
+name=$(envlock acquire --wait 3600)
+curl -s -o /dev/null -w '%{http_code}\n' "https://$name.vipdev.lndo.site/"
+```
+
+The lease ends when the agent finishes its turn. On its next turn the agent runs `envlock acquire` again and usually gets the same environment back, without switching code.
+
+### Test on the versions production runs
+
+Look up the hosted environment's versions, then ask for them:
+
+```console
+$ vip @my-app.preprod config software get   # output shortened
+WordPress  6.9
+PHP        8.2
+
+$ envlock acquire --need wp=6.9 --need php=8.2
+site2
+```
+
+If no environment has those versions, envlock changes a free one first. That takes about 30 seconds on VIP dev-env.
+
+### Prefer a version without waiting for it
+
+A styling fix looks the same on any WordPress version, but the ticket is easier to compare with production on 6.9:
+
+```bash
+envlock acquire --want wp=6.9
+```
+
+envlock picks a 6.9 environment if one is free and takes any free environment otherwise.
+
+### Three tickets, two environments
+
+1. ABC-101 runs `envlock acquire --need wp=6.9` and gets `site2`.
+2. ABC-102 runs `envlock acquire` and gets `site3`. No environment is free now, so envlock starts building `site4` in the background.
+3. ABC-103 runs `envlock acquire --wait 3600` and waits. It gets the first environment that frees up, or `site4` when it is ready.
+4. ABC-101 finishes its turn and its lease ends. Its next `acquire` prefers `site2` again.
+5. Once every ticket whose most recent environment is `site4` has finished and had its worktree deleted, envlock removes `site4`, as long as another environment is free.
+
 ## Start a session per ticket
 
 In Claude Code, give the skill your project and tickets:
