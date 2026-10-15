@@ -90,6 +90,8 @@ If the file is missing, stop and tell the user that the repo needs an untracked
    - Your ticket is `<ticket>`. Read the ticket first, then work on it in this worktree.
    - Before anything that needs the environment, run `envlock acquire --wait 3600`.
      It prints the environment name, and `envlock env` prints it again.
+   - Run `envlock acquire` without piping it through `head`, `tail` or `grep`, and check the
+     lease with `envlock env` before you use the environment.
    - Pick the version flags for `envlock acquire` from the ticket, using a `key=value` that
      `envlock status` shows: `--need wp=6.9` when the ticket must be tested on that version,
      `--want wp=6.9` when that version is preferred but any will do, and neither when the

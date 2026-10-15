@@ -67,7 +67,7 @@ Run these from any worktree of the project:
 | `envlock acquire --want wp=6.9` | Prefers an environment with `wp=6.9`, but leases any free one when none matches. Repeat `--want` for more attributes. Ignored without `envpool_describe`. |
 | `envlock env` | Prints the environment this worktree leases, or exits with status 1 if there is none. |
 | `envlock release` | Ends this worktree's lease early. |
-| `envlock status` | Shows which environments are in use, by which ticket and which herdr pane, and who is waiting. When `.envpool` has `envpool_describe`, each environment's line ends with its attributes. |
+| `envlock status` | Shows which environments are in use, by which ticket and which herdr pane, and who is waiting. When `.envpool` has `envpool_describe`, each environment's line ends with its attributes. The last line is the path of the events log. |
 | `envlock grow` | Adds an environment to the pool now, even past `ENVPOOL_MAX`. |
 | `envlock shrink` | Removes the environments envlock added that no unfinished ticket uses, now. At least one environment stays free. |
 | `envlock suspend` | Stops the free environments that no unfinished ticket uses, now. Needs `envpool_suspend`. |
@@ -82,6 +82,8 @@ When a lease takes the last free environment, envlock builds another one in the 
 
 When `.envpool` has `envpool_suspend`, envlock stops free environments that no existing worktree has as its most recent lease, to save memory, and `envlock status` shows them as `free, suspended`. The next lease starts the environment again through `envpool_attach`, so `envpool_attach` must start a stopped environment and `envpool_reset` must cope with one.
 
+envlock writes one line for each lease, release and failure to the events log, for example `leased`, `released`, `attach-failed` and `timeout`. Read it when an acquire fails or a lease ends and you do not know why. It records which step failed and with what exit status, which the terminal of the agent that ran `envlock acquire` can lose.
+
 ## Examples
 
 These examples use a VIP dev-env project whose pool has two environments, `site2` and `site3`. `site` is the seed, which serves the main checkout.
@@ -93,6 +95,7 @@ $ envlock status
 1/2 in use, 1 free, 0 queued, cap 3
 site2  held by ~/worktrees/my-project/ABC-101 (ABC-101-fix-menu) pane w3:p1 pid 41872  wp=6.9 php=8.2
 site3  free  wp=7.1 php=8.4
+events log: ~/.local/state/envlock/3f9a1c07d2b4/events.log
 ```
 
 ### Run a check against the site

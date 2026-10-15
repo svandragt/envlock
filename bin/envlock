@@ -49,11 +49,13 @@ session_id() {
 	echo "$HERDR_PANE_ID"
 }
 
-# Blocks until session $1 is idle, done or gone. It execs, so call it in a process of its own: that process becomes the waiter, and killing it ends the wait.
-session_wait_idle() { exec herdr agent wait "$1" --until idle --until 'done'; }
+# Blocks until session $1 is idle, done or gone; fails when it cannot wait. It does not exec: the holder runs it as a child and ends it by killing the process group.
+session_wait_idle() { herdr agent wait "$1" --until idle --until 'done'; }
 
 worktree=$(git rev-parse --show-toplevel)
 branch=$(git -C "$worktree" branch --show-current)
+# Names the worktree in the events log; a detached HEAD has no branch.
+label=${branch:-$(basename "$worktree")}
 # Locks live per repository, not per worktree, so every worktree shares one pool.
 common=$(cd "$worktree" && realpath "$(git rev-parse --git-common-dir)")
 state="${XDG_STATE_HOME:-$HOME/.local/state}/envlock"
@@ -64,6 +66,18 @@ queue="$lockdir/queue"
 # One record per worktree: its path on line 1 and the env it leased last on line 2.
 last="$lockdir/last"
 mkdir -p "$queue" "$last" "$envdir"
+
+# Appends one line to the events log. A failing write never fails envlock.
+log() { printf '%s %s\n' "$(date +%FT%T)" "$*" >>"$lockdir/events.log" || true; }
+
+# The holder: runs the wait as a child with fd 9 closed, so only the holder keeps the lease. A TERM from `envlock release` kills the whole process group, wait included, and logs nothing, because release logs it.
+hold() {
+	local why='idle or done'
+	trap 'trap - TERM; kill 0' TERM
+	session_wait_idle "$2" 9>&- &
+	wait "$!" || why="wait failed, exit=$?"
+	log released "$1" "$label" pane "$2" "($why)"
+}
 
 # Fall back to the main checkout, so an untracked .envpool serves every worktree.
 pool="$worktree/.envpool"
@@ -98,8 +112,11 @@ needs_met() {
 
 # Runs envpool_configure on env $1 for the needed pairs. After a failure the env is in an unknown state, so the attach record goes.
 run_configure() {
+	local rc=0
 	echo "envlock: configuring $1 for ${need[*]}" >&2
-	if ! ENVLOCK_ENV=$1 ENVLOCK_WORKTREE=$worktree hook envpool_configure "${need[@]}" >&2; then
+	ENVLOCK_ENV=$1 ENVLOCK_WORKTREE=$worktree hook envpool_configure "${need[@]}" >&2 || rc=$?
+	if [ "$rc" -ne 0 ]; then
+		log configure-failed "$1" "$label" pane "$session" "exit=$rc"
 		rm -f "$envdir/$1.attached"
 		echo "envlock: configuring $1 failed" >&2
 		return 1
@@ -146,8 +163,10 @@ grow() {
 		# Inside an if, set -e is off, so envpool_create has to return non-zero itself.
 		if ENVLOCK_ENV=$new hook envpool_create >&2; then
 			echo "$new" >>"$lockdir/envs"
+			log grown "$new"
 			echo "envlock: added $new" >&2
 		else
+			log grow-failed "$new" "exit=$?"
 			echo "envlock: creating $new failed, not added" >&2
 			return 1
 		fi
@@ -210,9 +229,11 @@ shrink() {
 				if ENVLOCK_ENV=$e hook envpool_destroy >&2; then
 					awk -v e="$e" '$0 != e' "$lockdir/envs" >"$lockdir/envs.tmp" && mv "$lockdir/envs.tmp" "$lockdir/envs"
 					rm -f "$envdir/$e".{holder,attached,suspended}
+					log shrunk "$e"
 					echo "envlock: removed $e" >&2
 					removed=1
 				else
+					log destroy-failed "$e" "exit=$?"
 					echo "envlock: destroying $e failed, kept" >&2
 				fi
 			} 7>"$envdir/$e.lock"
@@ -243,8 +264,10 @@ suspend() {
 				# Inside an if, set -e is off, so envpool_suspend has to return non-zero itself.
 				if ENVLOCK_ENV=$e hook envpool_suspend >&2; then
 					touch "$envdir/$e.suspended"
+					log suspended "$e"
 					echo "envlock: suspended $e" >&2
 				else
+					log suspend-failed "$e" "exit=$?"
 					echo "envlock: suspending $e failed" >&2
 				fi
 			} 7>"$envdir/$e.lock"
@@ -262,7 +285,7 @@ shrink_in_background() {
 	fi
 }
 
-# Sets lease_env and lease_pid when this worktree holds a live lease.
+# Sets lease_env, lease_pid and lease_pane when this worktree holds a live lease.
 find_lease() {
 	local holder
 	load_envs
@@ -270,6 +293,8 @@ find_lease() {
 		holder=$(cat "$envdir/$lease_env.holder" 2>/dev/null) || continue
 		[[ $holder == "$worktree ("* ]] || continue
 		lease_pid=${holder##* pid }
+		lease_pane=${holder##* pane }
+		lease_pane=${lease_pane%% *}
 		# Holder files outlive their lease, so only trust a pid that still has this env's lock open.
 		[ "$(readlink "/proc/$lease_pid/fd/9" 2>/dev/null)" = "$envdir/$lease_env.lock" ] && return 0
 	done
@@ -299,10 +324,13 @@ try_order() {
 
 # Leaves the lease on fd 9 and its env name in $e; exits 75 when none frees up within $1 seconds.
 acquire() {
-	local deadline=$((SECONDS + $1)) grow_failed='' mismatch='' rc q=() order=()
+	local deadline=$((SECONDS + $1)) grow_failed='' mismatch='' rc q=() order=() asks=("${need[@]/#/need=}" "${want[@]/#/want=}")
 	qentry="$queue/$(date +%s%N).$$"
 	echo "$worktree ($branch) pid $$" >"$qentry"
-	trap 'rm -f "$qentry"' EXIT
+	# Names the hook that is running, so the EXIT trap can log it when set -e ends the script.
+	stage=''
+	trap 'rc=$?; [ -z "$stage" ] || log "$stage-failed" "$e" "$label" pane "$session" "exit=$rc"; rm -f "$qentry"' EXIT
+	log queued "$label" pane "$session" "${asks[@]}"
 	while :; do
 		mapfile -t q < <(queue_entries)
 		if [ "${q[0]:-}" = "$qentry" ]; then
@@ -331,7 +359,11 @@ acquire() {
 				[ "$rc" -ne 0 ] || continue
 			fi
 		fi
-		[ "$SECONDS" -lt "$deadline" ] || { echo "envlock: all environments busy${need[*]:+ or lacking ${need[*]}}" >&2; exit 75; }
+		[ "$SECONDS" -lt "$deadline" ] || {
+			echo "envlock: all environments busy${need[*]:+ or lacking ${need[*]}}" >&2 || true
+			log timeout "$label" pane "$session" "${asks[@]}"
+			exit 75
+		}
 		sleep 5
 	done
 	rm -f "$qentry"
@@ -342,24 +374,29 @@ acquire() {
 	rm -f "$envdir/$e.suspended"
 	# Written through a dot file and mv, so a shrink never reads half a record.
 	printf '%s\n%s\n' "$worktree" "$e" >"$last/.$$" && mv "$last/.$$" "$last/$(printf '%s' "$worktree" | sha1sum | cut -c1-40)"
-	echo "envlock: using $e" >&2
+	# Not "using" yet: a caller that stops reading at this line must not take the env for leased.
+	echo "envlock: preparing $e" >&2 || true
 	[ -z "$mismatch" ] || run_configure "$e" || exit 1
-	# Hook output goes to stderr, so stdout carries only the env name.
-	if declare -F envpool_reset >/dev/null; then hook envpool_reset >&2; fi
+	# Hook output goes to stderr, so stdout carries only the env name. The hooks below run as plain commands, so set -e applies inside them; set -e ends the script with the hook's status, which the EXIT trap logs.
+	if declare -F envpool_reset >/dev/null; then stage=reset; hook envpool_reset >&2; fi
 	if declare -F envpool_attach >/dev/null; then
 		if [ "$(cat "$envdir/$e.attached" 2>/dev/null)" = "$worktree" ] && { ! declare -F envpool_healthy >/dev/null || hook envpool_healthy >&2; }; then
-			echo "envlock: $e already serves $worktree" >&2
+			echo "envlock: $e already serves $worktree" >&2 || true
 		else
 			# The record is written only after a switch that succeeded; a failing hook exits under set -e before it.
 			rm -f "$envdir/$e.attached"
+			stage=attach
 			hook envpool_attach >&2
 			printf '%s\n' "$worktree" >"$envdir/$e.attached"
 		fi
 	fi
-	# The holder inherits fd 9 and keeps the lease until the session is idle or done, or the wait fails.
-	setsid bash -c "$(declare -f session_wait_idle); session_wait_idle \"\$1\"" _ "$session" </dev/null >>"$lockdir/holder.log" 2>&1 &
+	stage=''
+	# The holder inherits fd 9 and keeps the lease until the wait that it runs as a child returns.
+	setsid bash -c "$(declare -p lockdir label; declare -f log session_wait_idle hold); hold \"\$@\"" _ "$e" "$session" </dev/null >>"$lockdir/holder.log" 2>&1 &
 	echo "$worktree ($branch) pane $session pid $!" >"$envdir/$e.holder"
+	log leased "$e" "$label" pane "$session" pid "$!"
 	exec 9>&-
+	echo "envlock: using $e" >&2 || true
 	echo "$e"
 	show_info "$e"
 	headroom || shrink_in_background
@@ -388,8 +425,11 @@ status)
 	for i in "${!q[@]}"; do
 		echo "queued $((i + 1))  $(cat "${q[$i]}" 2>/dev/null || true)"
 	done
+	echo "events log: $lockdir/events.log"
 	;;
 acquire)
+	# A caller that closes the pipe (`| head -1`) then makes writes fail instead of killing envlock mid-attach with SIGPIPE.
+	trap '' PIPE
 	wait=0
 	need=() want=()
 	while [ $# -gt 0 ]; do
@@ -404,7 +444,7 @@ acquire)
 	done
 	if ! declare -F envpool_describe >/dev/null; then
 		[ "${#need[@]}" -eq 0 ] || { echo "envlock: --need requires envpool_describe in .envpool" >&2; exit 1; }
-		[ "${#want[@]}" -eq 0 ] || echo "envlock: ignoring --want, .envpool has no envpool_describe" >&2
+		[ "${#want[@]}" -eq 0 ] || echo "envlock: ignoring --want, .envpool has no envpool_describe" >&2 || true
 		want=()
 	fi
 	session=$(session_id) || exit 1
@@ -413,6 +453,7 @@ acquire)
 			declare -F envpool_configure >/dev/null || { echo "envlock: $lease_env lacks ${need[*]} and .envpool has no envpool_configure; run envlock release first" >&2; exit 1; }
 			run_configure "$lease_env" || exit 1
 		fi
+		log reused "$lease_env" "$label" pane "$session"
 		echo "$lease_env"
 		show_info "$lease_env"
 		exit 0
@@ -426,6 +467,7 @@ env)
 release)
 	find_lease || { echo "envlock: no lease held by $worktree"; exit 0; }
 	kill "$lease_pid"
+	log released "$lease_env" "$label" pane "$lease_pane" "(release)"
 	echo "envlock: released $lease_env (pid $lease_pid)"
 	;;
 grow)
