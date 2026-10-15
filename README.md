@@ -28,6 +28,7 @@ envpool_reset() { ...; }     # clean up before each lease, for example flush cac
 envpool_create() { ...; }    # build $ENVLOCK_ENV, including its database; return non-zero on failure
 envpool_destroy() { ...; }   # remove $ENVLOCK_ENV; return non-zero on failure. Without it the pool never shrinks
 envpool_describe() { ...; }  # print the attributes of $ENVLOCK_ENV as key=value pairs, for example: wp=7.1 php=8.4
+envpool_suspend() { ...; }   # stop $ENVLOCK_ENV to save memory; envpool_attach must start it again
 envpool_configure() { ...; } # change $ENVLOCK_ENV to the key=value pairs in "$@"; return non-zero on failure
 envpool_info() { ...; }      # print a hint for the agent after each acquire, for example a login URL for $ENVLOCK_ENV
 ```
@@ -52,6 +53,7 @@ Run these from any worktree of the project:
 | `envlock status` | Shows which environments are in use, by which ticket and which herdr pane, and who is waiting. When `.envpool` has `envpool_describe`, each environment's line ends with its attributes. |
 | `envlock grow` | Adds an environment to the pool now, even past `ENVPOOL_MAX`. |
 | `envlock shrink` | Removes the environments envlock added that no unfinished ticket uses, now. At least one environment stays free. |
+| `envlock suspend` | Stops the free environments that no unfinished ticket uses, now. Needs `envpool_suspend`. |
 
 Without `--wait`, envlock gives up straight away when every environment is busy.
 
@@ -60,6 +62,8 @@ Use `--need` when a ticket must run on a given version. envlock leases a free en
 Use `--want` when a version is preferred but any will do. It only changes which free environment envlock tries first. It never changes an environment, never waits for a match and never fails on a mismatch. You can combine the two: `--need` decides which environments qualify, and `--want` picks among them.
 
 When a lease takes the last free environment, envlock builds another one in the background, up to `ENVPOOL_MAX`, so the next ticket does not wait for it. After each lease, envlock also removes an environment it added earlier when no existing worktree has it as its most recent lease and another environment is free. Environments in `ENVS` are never removed.
+
+When `.envpool` has `envpool_suspend`, envlock stops free environments that no existing worktree has as its most recent lease, to save memory, and `envlock status` shows them as `free, suspended`. The next lease starts the environment again through `envpool_attach`, so `envpool_attach` must start a stopped environment and `envpool_reset` must cope with one.
 
 ## Examples
 

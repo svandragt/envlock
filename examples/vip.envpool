@@ -16,6 +16,9 @@ envpool_attach() {
 	vip dev-env start --slug="$ENVLOCK_ENV" --skip-wp-versions-check
 }
 
+# Stops a spare env to save memory. The next acquire runs envpool_attach, which starts it again.
+envpool_suspend() { vip dev-env stop --slug="$ENVLOCK_ENV"; }
+
 envpool_healthy() { [ "$(docker inspect -f '{{.State.Running}}' "$ENVLOCK_ENV-php-1" 2>/dev/null)" = true ]; }
 
 envpool_reset() {

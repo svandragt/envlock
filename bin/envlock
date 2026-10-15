@@ -15,6 +15,8 @@
 # envpool_create) changes an env that lacks a needed pair, before reset and attach.
 # envpool_info (sees ENVLOCK_ENV and ENVLOCK_WORKTREE) prints a hint for the caller,
 # such as a login URL, after every successful acquire, new lease or reuse.
+# envpool_suspend (sees ENVLOCK_ENV, same contract as envpool_destroy) stops a spare env
+# to save memory; the next acquire of it runs envpool_attach, which must start it.
 # Every hook runs with envlock's lock fds closed, so nothing a hook starts holds a lock.
 set -euo pipefail
 
@@ -25,17 +27,18 @@ usage() {
 	echo "       envlock status" >&2
 	echo "       envlock grow" >&2
 	echo "       envlock shrink" >&2
+	echo "       envlock suspend" >&2
 	exit "${1:-2}"
 }
 
 # Checked before any repo or pool lookup, so help works anywhere.
 case "${1:-}" in
-acquire | env | release | status | grow | shrink) ;;
+acquire | env | release | status | grow | shrink | suspend) ;;
 -h | --help | help) usage 0 ;;
 *) usage ;;
 esac
 
-# Runs hook $1 with envlock's lock fds closed (7 the shrink candidate's lease, 8 the pool, 9 the lease), so neither the hook nor a child it leaves running inherits a lock that envlock still holds.
+# Runs hook $1 with envlock's lock fds closed (7 the shrink or suspend candidate's lease, 8 the pool, 9 the lease), so neither the hook nor a child it leaves running inherits a lock that envlock still holds.
 hook() { "$@" 7>&- 8>&- 9>&-; }
 
 # These two functions are the only herdr-specific code.
@@ -55,7 +58,7 @@ branch=$(git -C "$worktree" branch --show-current)
 common=$(cd "$worktree" && realpath "$(git rev-parse --git-common-dir)")
 state="${XDG_STATE_HOME:-$HOME/.local/state}/envlock"
 lockdir="$state/$(printf '%s' "$common" | sha1sum | cut -c1-12)"
-# Each env's .lock, .holder and .attached files live here, outside the per-repo directory, so repos that list the same env share one lock.
+# Each env's .lock, .holder, .attached and .suspended files live here, outside the per-repo directory, so repos that list the same env share one lock.
 envdir="$state/envs"
 queue="$lockdir/queue"
 # One record per worktree: its path on line 1 and the env it leased last on line 2.
@@ -111,6 +114,8 @@ show_info() {
 can_grow() {
 	[ -n "${ENVPOOL_MAX:-}" ] && [ "${#all[@]}" -lt "$ENVPOOL_MAX" ] && declare -F envpool_create >/dev/null
 }
+
+can_suspend() { declare -F envpool_suspend >/dev/null; }
 
 # Prints the live queue entries oldest first and deletes the dead ones.
 # shortcut: kill -0 can match a recycled pid, so a dead waiter's entry may linger; store the process start time if that ever stalls the queue.
@@ -204,7 +209,7 @@ shrink() {
 				# Inside an if, set -e is off, so envpool_destroy has to return non-zero itself.
 				if ENVLOCK_ENV=$e hook envpool_destroy >&2; then
 					awk -v e="$e" '$0 != e' "$lockdir/envs" >"$lockdir/envs.tmp" && mv "$lockdir/envs.tmp" "$lockdir/envs"
-					rm -f "$envdir/$e".{holder,attached}
+					rm -f "$envdir/$e".{holder,attached,suspended}
 					echo "envlock: removed $e" >&2
 					removed=1
 				else
@@ -217,10 +222,43 @@ shrink() {
 	[ -z "$removed" ] || headroom || true
 }
 
-# Starts a shrink in the background when growth has added envs and envpool_destroy can remove them.
+# Stops the spare envs: pool envs that no live worktree last leased and nobody holds. The marker makes the next acquire run envpool_attach, which starts the env again.
+# Returns 0 when it ran, 2 when it could not start.
+suspend() {
+	local e
+	can_suspend || { echo "envlock: .envpool needs envpool_suspend to suspend" >&2; return 2; }
+	# Fd 8 is the pool lock, fd 7 the candidate's lease lock.
+	{
+		flock -n 8 || { echo "envlock: a grow or shrink is running" >&2; return 2; }
+		load_envs
+		for e in "${all[@]}"; do
+			[ ! -e "$envdir/$e.suspended" ] || continue
+			{
+				# Holding the lease lock stops anyone leasing $e while it is stopped.
+				flock -n 7 || continue
+				if env_in_use "$e"; then continue; fi
+				echo "envlock: suspending $e" >&2
+				# Deleted first, so a half-stopped env still gets envpool_attach on its next lease.
+				rm -f "$envdir/$e.attached"
+				# Inside an if, set -e is off, so envpool_suspend has to return non-zero itself.
+				if ENVLOCK_ENV=$e hook envpool_suspend >&2; then
+					touch "$envdir/$e.suspended"
+					echo "envlock: suspended $e" >&2
+				else
+					echo "envlock: suspending $e failed" >&2
+				fi
+			} 7>"$envdir/$e.lock"
+		done
+	} 8>"$lockdir/grow.lock"
+}
+
+# Starts a shrink, when growth has added envs and envpool_destroy can remove them, and then a suspend pass, when envpool_suspend exists, in one background job.
 shrink_in_background() {
-	if declare -F envpool_destroy >/dev/null && [ -s "$lockdir/envs" ]; then
-		setsid "$0" shrink 9>&- </dev/null >>"$lockdir/grow.log" 2>&1 &
+	local steps=()
+	if declare -F envpool_destroy >/dev/null && [ -s "$lockdir/envs" ]; then steps+=(shrink); fi
+	if can_suspend; then steps+=(suspend); fi
+	if [ "${#steps[@]}" -gt 0 ]; then
+		setsid bash -c "for s; do \"\$0\" \"\$s\"; done" "$0" "${steps[@]}" 9>&- </dev/null >>"$lockdir/grow.log" 2>&1 &
 	fi
 }
 
@@ -300,6 +338,8 @@ acquire() {
 	export ENVLOCK_ENV=$e ENVLOCK_WORKTREE=$worktree
 	# No pid yet, so find_lease ignores this record until the holder runs.
 	echo "$worktree ($branch) pane $session" >"$envdir/$e.holder"
+	# The env is leased now. Configure and reset run before envpool_attach starts it, so they may see it stopped.
+	rm -f "$envdir/$e.suspended"
 	# Written through a dot file and mv, so a shrink never reads half a record.
 	printf '%s\n%s\n' "$worktree" "$e" >"$last/.$$" && mv "$last/.$$" "$last/$(printf '%s' "$worktree" | sha1sum | cut -c1-40)"
 	echo "envlock: using $e" >&2
@@ -334,7 +374,9 @@ status)
 	for e in "${all[@]}"; do
 		attrs=$(describe "$e")
 		if flock -n "$envdir/$e.lock" true 2>/dev/null; then
-			lines+=("$e  free${attrs:+  $attrs}")
+			susp=''
+			[ ! -e "$envdir/$e.suspended" ] || susp=', suspended'
+			lines+=("$e  free$susp${attrs:+  $attrs}")
 		else
 			busy=$((busy + 1))
 			lines+=("$e  held by $(cat "$envdir/$e.holder" 2>/dev/null || echo unknown)${attrs:+  $attrs}")
@@ -387,10 +429,14 @@ release)
 	echo "envlock: released $lease_env (pid $lease_pid)"
 	;;
 grow)
-	grow "${1:-}"
+	# A grow that acquire runs itself does not suspend: the waiter takes the new env at once.
+	grow "${1:-}" && { ! can_suspend || suspend; }
 	;;
 shrink)
 	shrink
+	;;
+suspend)
+	suspend
 	;;
 *) usage ;;
 esac
