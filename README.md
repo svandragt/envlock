@@ -26,6 +26,7 @@ envpool_attach() { ...; }    # point $ENVLOCK_ENV at the code in $ENVLOCK_WORKTR
 envpool_healthy() { ...; }   # return 0 when $ENVLOCK_ENV is up and already serves its code
 envpool_reset() { ...; }     # clean up before each lease, for example flush caches
 envpool_create() { ...; }    # build $ENVLOCK_ENV, including its database; return non-zero on failure
+envpool_exists() { ...; }    # return 0 when an environment named $1 already exists, so growth picks another name
 envpool_destroy() { ...; }   # remove $ENVLOCK_ENV; return non-zero on failure. Without it the pool never shrinks
 envpool_describe() { ...; }  # print the attributes of $ENVLOCK_ENV as key=value pairs, for example: wp=7.1 php=8.4
 envpool_suspend() { ...; }   # stop $ENVLOCK_ENV to save memory; envpool_attach must start it again
@@ -34,6 +35,22 @@ envpool_info() { ...; }      # print a hint for the agent after each acquire, fo
 ```
 
 Only `ENVS` is required. Leave out `ENVPOOL_MAX` and `envpool_create` to keep the pool a fixed size. [`examples/vip.envpool`](examples/vip.envpool) is a complete example for VIP dev-env sites.
+
+### Set up a pool for a VIP dev-env site
+
+1. Copy [`examples/vip.envpool`](examples/vip.envpool) to `.envpool` in the main checkout, and add `.envpool` to `.git/info/exclude`.
+2. Set `ENVPOOL_SEED` to the environment that serves the main checkout. New environments copy its WordPress and PHP versions and its database.
+3. Set `ENVS` to one new name, such as `my-site2`, and `ENVPOOL_PREFIX` to `my-site`.
+4. Set the title, multisite type, mu-plugins and media domain to the values the seed was created with. The seed's `~/.local/share/vip/dev-environment/<seed>/instance_data.json` holds them as `wpTitle`, `multisite`, `muPlugins` and `mediaRedirectDomain`.
+5. Create the first environment, because envlock expects every name in `ENVS` to exist:
+
+   ```bash
+   bash -c 'source .envpool; ENVLOCK_ENV=my-site2 envpool_create'
+   ```
+
+6. Run `envlock status`. It lists the new environment as free.
+
+The example runs the `vip` CLI through the main checkout's devbox. If `vip` is on your `PATH`, delete the `vip()` function.
 
 After every `envlock acquire`, including when the worktree already holds a lease, envlock prints the output of `envpool_info` on stderr. `name=$(envlock acquire)` still gets only the name. The VIP example prints an https URL that logs in to the site's admin without a password.
 
