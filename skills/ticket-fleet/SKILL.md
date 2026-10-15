@@ -40,12 +40,17 @@ If the file is missing, stop and tell the user that the repo needs an untracked
 
 ## Steps for each ticket
 
-1. Build the branch name. Use `<ticket>-<slug>`, with the slug from the title in
-   lowercase words joined by hyphens. Use `<ticket>` alone when no title is known.
+1. Get the ticket title. Use the title the user gave. Otherwise look it up in the
+   tracker: `gh issue view <ticket> --json title` for a GitHub issue number, the Jira
+   tools for a key such as `ABC-740`. Build the slug from two to four key words of the
+   title, in lowercase and joined by hyphens: "Annual report shows the wrong release"
+   gives `annual-report-release`. Use `<ticket>` alone only when no title can be found.
+   The branch is `<ticket>-<slug>` and the label is `<ticket> <slug words>`, such as
+   `ABC-740 annual report release`, so the workspace shows what the ticket is about.
 2. Create the worktree without taking focus:
 
    ```bash
-   herdr worktree create --cwd <repo> --branch <branch> --label <ticket> --no-focus
+   herdr worktree create --cwd <repo> --branch <branch> --label "<label>" --no-focus
    ```
 
    Read `root_pane.pane_id`, `workspace.workspace_id` and `worktree.path` from the
@@ -53,14 +58,15 @@ If the file is missing, stop and tell the user that the repo needs an untracked
    report it, skip this ticket and continue with the next.
 3. Name the agent. herdr accepts only names that start with a lowercase letter, contain
    only `a-z`, `0-9`, `_` and `-`, and are 1 to 32 characters long, so the ticket ID alone
-   (`ABC-740`, `1234`) is rejected. Use `t-` plus the lowercased ticket ID, with any other
+   (`ABC-740`, `1234`) is rejected. Use `t-` plus the lowercased branch name, with any other
    character turned into `-` and the result cut to 32 characters:
 
    ```bash
-   name=$(printf 't-%s' "<ticket>" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_-' - | cut -c1-32)
+   name=$(printf 't-%s' "<branch>" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_-' - | cut -c1-32)
    ```
 
-   `ABC-740` gives `t-abc-740` and `1234` gives `t-1234`. Use this name wherever the steps
+   `ABC-740-annual-report-release` gives `t-abc-740-annual-report-release`, and `1234` with no
+   title gives `t-1234`. Use this name wherever the steps
    below say `<name>`.
 4. Start Claude in that pane, then wait until it is ready:
 
