@@ -1,10 +1,15 @@
-<img align="left" src="docs/icon.svg" width="128" height="128" alt="Three books on a shelf, one lifted out with a lending tag">
-
 # envlock
 
-Your local environments, leased like a library book.
+<table><tr>
+<td width="144" valign="top"><img src="docs/icon.svg" width="128" height="128" alt="Three books on a shelf, one lifted out with a lending tag"></td>
+<td valign="top">
+
+**Your local environments, leased like a library book.**
 
 envlock cuts context switching when you juggle several tickets on one machine. Each ticket keeps its own git worktree and its own agent session, so you can leave a ticket and come back to it without re-explaining anything or stashing work. Local dev environments are shared from a small pool. An agent leases one only when it is about to use it, waits its turn if none is free, and gets the same environment back next time if it can. The lease ends when the agent finishes its turn. Think php-fpm, but the workers are dev environments.
+
+</td>
+</tr></table>
 
 ## You
 
