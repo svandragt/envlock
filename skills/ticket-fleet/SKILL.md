@@ -38,6 +38,27 @@ If the file is missing, stop and tell the user that the repo needs an untracked
 - Optional, to let the pool grow: `ENVPOOL_PREFIX`, `ENVPOOL_MAX`,
   `envpool_create` and `envpool_exists`.
 
+## Before the tickets
+
+Run this once per fleet, before creating any worktree:
+
+1. Fetch the remote, so new worktrees start from current code. If the fetch fails, tell the
+   user and stop:
+
+   ```bash
+   git -C <repo> fetch origin
+   ```
+
+2. Find the base ref that tickets start from:
+
+   ```bash
+   git -C <repo> symbolic-ref --short refs/remotes/origin/HEAD
+   ```
+
+   It prints a ref such as `origin/main`. If it fails, use the branch the user names, as
+   `origin/<branch>`. If the user named none, ask which branch tickets start from. Use this
+   ref wherever the steps below say `<base>`.
+
 ## Steps for each ticket
 
 1. Get the ticket title. Use the title the user gave. Otherwise look it up in the
@@ -50,10 +71,10 @@ If the file is missing, stop and tell the user that the repo needs an untracked
 2. Create the worktree without taking focus:
 
    ```bash
-   herdr worktree create --cwd <repo> --branch <branch> --label "<label>" --no-focus
+   herdr worktree create --cwd <repo> --branch <branch> --label "<label>" --base <base> --no-focus
    ```
 
-   Read `root_pane.pane_id`, `workspace.workspace_id` and `worktree.path` from the
+   A `<base>` of `origin/preprod` gives `--base origin/preprod`. Read `root_pane.pane_id`, `workspace.workspace_id` and `worktree.path` from the
    JSON (under `.result` if the output has that wrapper). If the command fails,
    report it, skip this ticket and continue with the next.
 3. Name the agent. herdr accepts only names that start with a lowercase letter, contain
@@ -104,5 +125,5 @@ If the file is missing, stop and tell the user that the repo needs an untracked
 
 ## Finish
 
-List one line per ticket as `ticket -> workspace id -> branch`, then the output of
+List one line per ticket as `ticket -> workspace id -> branch (from <base>)`, then the output of
 `envlock status` run from `<repo>`. Name any ticket that was skipped and why, and any session that was not ready, with its workspace id.
