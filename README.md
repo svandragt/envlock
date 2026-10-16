@@ -1,5 +1,5 @@
 <table><tr>
-<td width="192" valign="top"><img src="docs/icon.svg" width="176" height="176" alt="Three books on a shelf, one lifted out with a lending tag"></td>
+<td width="192" valign="middle"><img src="docs/icon.svg" width="176" height="176" alt="Three books on a shelf, one lifted out with a lending tag"></td>
 <td valign="top">
 
 # envlock
