@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Runs every t-*.sh suite, prints each summary line and exits non-zero if any suite fails.
+here=$(cd "$(dirname "$0")" && pwd)
+rc=0
+for t in "$here"/t-*.sh; do
+	out=$("$t" 2>&1) || { rc=1; grep '^  FAIL' <<<"$out"; }
+	echo "$(basename "$t"): $(grep '^passed=' <<<"$out" || echo 'no summary')"
+done
+exit "$rc"

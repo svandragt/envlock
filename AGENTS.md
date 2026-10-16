@@ -7,6 +7,7 @@ Guidance for coding agents working in this repository. `README.md` covers what e
 - `bin/envlock`: the whole tool, one bash script. `~/.local/bin/envlock` is a symlink to it.
 - `skills/ticket-fleet/SKILL.md`: a Claude Code skill that starts a herdr worktree and session per ticket. `~/.claude/skills/ticket-fleet` is a symlink to it.
 - `examples/vip.envpool`: an anonymised copy of a real pool config for VIP dev-env sites. The real file lives untracked in that project's main checkout.
+- `tests/`: the test suite. `tests/run` runs every `t-*.sh` suite, `tests/lib.sh` holds their shared helpers and `tests/bin/herdr` is the stub herdr.
 
 ## How a lease works
 
@@ -66,10 +67,12 @@ Guidance for coding agents working in this repository. `README.md` covers what e
 
 ## Testing
 
-There is no test suite. Test changes in a scratch git repo with a dummy `.envpool` whose hooks only echo, and point `XDG_STATE_HOME` at a scratch directory so the real state under `~/.local/state/envlock` stays untouched.
+Run `tests/run` from any directory, about 40 seconds. It runs every `tests/t-*.sh` suite, prints each suite's `passed=N failed=M` line and exits non-zero if any suite fails, after listing the failing checks. Each suite tests `bin/envlock` in this checkout, never `~/.local/bin/envlock`. It keeps all its scratch state (git repos, `XDG_STATE_HOME`, pane files) in a `mktemp -d` directory that it removes on exit, so the real state under `~/.local/state/envlock` stays untouched.
 
-`acquire` needs a `herdr` on `PATH` and `HERDR_PANE_ID` set. Put a stub `herdr` first on `PATH` whose `agent wait <pane>` blocks until a file named after the pane appears, and create that file to simulate the agent going idle. Never call the real `herdr agent wait` or `herdr agent prompt` from a test. Run several `envlock acquire --wait N` calls in the background, each from its own worktree and pane, to exercise the queue. Never test grow, create, shrink or destroy against a real project's environments.
+`acquire` needs a `herdr` on `PATH` and `HERDR_PANE_ID` set. `tests/lib.sh` puts the stub `tests/bin/herdr` first on `PATH`. The stub's `agent wait <pane>` blocks until a file named after the pane appears in `$STUB_DIR`, or until `$STUB_DIR` is removed, and the stub refuses every other subcommand. A test creates the pane's file to simulate the agent going idle. Never call the real `herdr agent wait` or `herdr agent prompt` from a test.
+
+New behaviour gets checks in a `t-*.sh` file: the matching suite, or a new `t-*.sh` file, which `tests/run` picks up. A suite calls `fresh <name>` for a scratch repo whose dummy `.envpool` hooks only log to `$TEST_LOG` (the `TEST_*` variables in `write_pool` in `tests/lib.sh` switch hooks on), runs `acq <dir> [args]` to acquire as a new pane, and records each observation with `check "description" command`. Run several `acq ... --wait N` calls in the background, each from its own worktree and pane, to exercise the queue. The suites reach the stub and envlock through symlinks in the scratch directory, so `pgrep` patterns on their command lines match only processes of that run. Anchor any new `pgrep` or `pkill` pattern and include `$SCR` in it, so a test never touches a real holder or `herdr wait`. Never test grow, create, shrink or destroy against a real project's environments.
 
 To test the hooks for real, use a throwaway sandbox: a scratch git repo with its own devbox, its own seed environment and an untracked `.envpool` whose environments have a prefix no real project uses, such as `sbx`. Never create test tickets, branches or worktrees in a real project.
 
-Check the script with `bash -n bin/envlock` and `shellcheck bin/envlock`; if shellcheck is missing, run it through devbox or `nix shell nixpkgs#shellcheck`.
+Check the scripts with `bash -n bin/envlock` and `shellcheck -x bin/envlock tests/*.sh tests/run tests/bin/herdr`; if shellcheck is missing, run it through devbox or `nix shell nixpkgs#shellcheck`.

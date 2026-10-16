@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Stub herdr: "agent wait <pane> ..." blocks until $STUB_DIR/<pane> exists (the agent went idle) or $STUB_DIR is removed.
+[ "$1 $2" = "agent wait" ] || { echo "stub herdr: unexpected: $*" >&2; exit 2; }
+echo "$*" >>"$STUB_DIR/calls"
+while [ ! -e "$STUB_DIR/$3" ] && [ -d "$STUB_DIR" ]; do sleep 0.2; done
