@@ -1,3 +1,5 @@
+<img src="docs/icon.svg" width="128" height="128" alt="Three books on a shelf, one lifted out with a lending tag">
+
 # envlock
 
 Your local environments, leased like a library book.
