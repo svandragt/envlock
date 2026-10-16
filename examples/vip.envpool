@@ -2,6 +2,7 @@
 # Change these lines for your project. The rest stays the same for any VIP dev-env site.
 # The seed env serves the main checkout and stays out of the pool. New envs copy its versions and database.
 ENVPOOL_SEED=site
+# envlock creates a name listed here that does not exist yet, on the first acquire with --wait.
 ENVS=(site2)
 # envlock grows the pool with envpool_create up to ENVPOOL_MAX envs, named ${ENVPOOL_PREFIX}N.
 ENVPOOL_PREFIX=site

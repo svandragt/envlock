@@ -24,12 +24,13 @@ idle_all() { local n; [ -z "${STUB_DIR:-}" ] || for n in $(seq "$PN"); do touch 
 
 write_pool() { # dir: writes the dummy .envpool; hooks only log to $TEST_LOG
 	cat >"$1/.envpool" <<'EOP'
-ENVS=(${TEST_ENVS:-base})
+ENVS=(${TEST_ENVS-base})
 # With TEST_LEAK=file every hook starts a background sleep and appends its pid to the file, like a hook that starts a daemon.
 leak() { [ -z "${TEST_LEAK:-}" ] || { sleep 7771 >/dev/null 2>&1 </dev/null & echo $! >>"$TEST_LEAK"; }; }
 [ -z "${TEST_MAX:-}" ] || { ENVPOOL_PREFIX=${TEST_PREFIX:-g}; ENVPOOL_MAX=$TEST_MAX; }
-envpool_exists() { leak; [ -e "${TEST_DISK:-/nonexistent}/$1" ]; }
-envpool_create() { leak; echo "create $ENVLOCK_ENV" >>"$TEST_LOG"; sleep "${TEST_CSLEEP:-0}"; [ -z "${TEST_CFAIL:-}" ] && { [ -z "${TEST_ATTRS:-}" ] || echo wp=7.1 >"$TEST_ATTRS/$ENVLOCK_ENV"; }; }
+# With TEST_DISK=dir an env exists only while the file dir/<env> does, and envpool_create adds it; without, exactly the ENVS names exist.
+envpool_exists() { leak; if [ -n "${TEST_DISK:-}" ]; then [ -e "$TEST_DISK/$1" ]; else [[ " ${ENVS[*]} " == *" $1 "* ]]; fi; }
+envpool_create() { leak; echo "create $ENVLOCK_ENV" >>"$TEST_LOG"; sleep "${TEST_CSLEEP:-0}"; [ -z "${TEST_CFAIL:-}" ] && { [ -z "${TEST_ATTRS:-}" ] || echo wp=7.1 >"$TEST_ATTRS/$ENVLOCK_ENV"; } && { [ -z "${TEST_DISK:-}" ] || touch "$TEST_DISK/$ENVLOCK_ENV"; }; }
 envpool_reset() { leak; echo "reset $ENVLOCK_ENV" >>"$TEST_LOG"; }
 envpool_attach() { leak; echo "attach $ENVLOCK_ENV" >>"$TEST_LOG"; [ -z "${TEST_ATTACH_FAIL:-}" ]; }
 if [ -n "${TEST_HEALTHY_RC:-}" ]; then envpool_healthy() { leak; echo "healthy $ENVLOCK_ENV" >>"$TEST_LOG"; return "$TEST_HEALTHY_RC"; }; fi

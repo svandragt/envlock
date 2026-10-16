@@ -6,8 +6,9 @@
 # which lets envlock skip envpool_attach when the env already serves the
 # worktree. To let the pool grow it also sets ENVPOOL_PREFIX and
 # ENVPOOL_MAX and defines envpool_create (sees ENVLOCK_ENV, must return
-# non-zero on failure) and optionally envpool_exists NAME. To let it shrink
-# again it defines envpool_destroy (same contract as envpool_create).
+# non-zero on failure) and optionally envpool_exists NAME, which also lets acquire create
+# ENVS names that do not exist yet. To let it shrink again it defines envpool_destroy
+# (same contract as envpool_create).
 # envpool_describe (sees ENVLOCK_ENV) prints the env's attributes as space-separated
 # key=value pairs. With it, acquire --need key=value leases an env that has them and
 # acquire --want key=value only prefers an env that has them.
@@ -21,7 +22,7 @@
 set -euo pipefail
 
 usage() {
-	echo "usage: envlock acquire [--wait SECONDS] [--need KEY=VALUE]... [--want KEY=VALUE]..." >&2
+	echo "usage: envlock acquire [--wait SECONDS] [--urgent] [--need KEY=VALUE]... [--want KEY=VALUE]..." >&2
 	echo "       envlock env" >&2
 	echo "       envlock release" >&2
 	echo "       envlock status" >&2
@@ -70,6 +71,13 @@ mkdir -p "$queue" "$last" "$envdir"
 # Appends one line to the events log. A failing write never fails envlock.
 log() { printf '%s %s\n' "$(date +%FT%T)" "$*" >>"$lockdir/events.log" || true; }
 
+# Keeps the last 5000 lines of the events log once it passes 1 MiB.
+# shortcut: a line appended between the tail and the mv is lost; take the pool lock if lines ever matter.
+trim_log() {
+	[ "$(stat -c %s "$lockdir/events.log" 2>/dev/null || echo 0)" -gt 1048576 ] || return 0
+	tail -n 5000 "$lockdir/events.log" >"$lockdir/events.log.$$" && mv "$lockdir/events.log.$$" "$lockdir/events.log" || true
+}
+
 # The holder: runs the wait as a child with fd 9 closed, so only the holder keeps the lease. A TERM from `envlock release` kills the whole process group, wait included, and logs nothing, because release logs it.
 hold() {
 	local why='idle or done'
@@ -82,10 +90,12 @@ hold() {
 # Fall back to the main checkout, so an untracked .envpool serves every worktree.
 pool="$worktree/.envpool"
 [ -f "$pool" ] || pool="$(dirname "$common")/.envpool"
-[ -f "$pool" ] || { echo "envlock: no .envpool in $worktree or the main checkout" >&2; exit 1; }
+[ -f "$pool" ] || { echo "envlock: no .envpool in $worktree or the main checkout; ask your agent to set up a pool (see README)" >&2; exit 1; }
 # shellcheck source=/dev/null
 source "$pool"
-[ "${#ENVS[@]}" -gt 0 ] || { echo "envlock: .envpool sets no ENVS" >&2; exit 1; }
+# An empty ENVS is fine when the pool can grow from zero.
+[ "${#ENVS[@]}" -gt 0 ] || { [ "${ENVPOOL_MAX:-0}" -gt 0 ] && [ -n "${ENVPOOL_PREFIX:-}" ] && declare -F envpool_create >/dev/null; } ||
+	{ echo "envlock: .envpool sets no ENVS" >&2; exit 1; }
 
 # The pool is ENVS plus the envs that growth has added.
 load_envs() {
@@ -142,6 +152,31 @@ queue_entries() {
 		[ -e "$f" ] || continue
 		if kill -0 "${f##*.}" 2>/dev/null; then echo "$f"; else rm -f "$f"; fi
 	done
+}
+
+# Succeeds when env $1 is an ENVS name that envpool_exists reports missing; envlock creates such a name only when the pool has both hooks.
+is_missing() {
+	[[ " ${ENVS[*]} " == *" $1 "* ]] && declare -F envpool_exists envpool_create >/dev/null && ! hook envpool_exists "$1"
+}
+
+# Succeeds when env $1 exists. A missing ENVS name is created first. That takes minutes, so a caller without --wait ($2 is 0) never does it.
+# The caller holds the env's lease lock, so nobody else creates or leases it meanwhile; the pool lock keeps a grow or shrink out. After a failed create the env stays unusable for the rest of this acquire.
+create_missing() {
+	is_missing "$1" || return 0
+	[ "$2" -gt 0 ] && [[ " ${create_failed:-} " != *" $1 "* ]] || return 1
+	{
+		flock -n 8 || return 1
+		echo "envlock: creating $1" >&2
+		# Inside an if, set -e is off, so envpool_create has to return non-zero itself.
+		if ENVLOCK_ENV=$1 hook envpool_create >&2; then
+			log created "$1"
+		else
+			log create-failed "$1" "exit=$?"
+			create_failed+=" $1"
+			echo "envlock: creating $1 failed" >&2
+			return 1
+		fi
+	} 8>"$lockdir/grow.lock"
 }
 
 # Returns 0 when an env was added, 1 when envpool_create failed, 2 when nothing was attempted.
@@ -301,21 +336,40 @@ find_lease() {
 	return 1
 }
 
-# Prints the pool in the order acquire tries it: envs with the needed attributes before the rest, then envs with the wanted ones, then envs whose holder names this worktree.
+# Ends the lease that this pane holds for another worktree, because a pane holds one lease at a time. Needs load_envs first.
+release_pane_lease() {
+	local e holder pid wt name
+	for e in "${all[@]}"; do
+		holder=$(cat "$envdir/$e.holder" 2>/dev/null) || continue
+		[[ $holder == *" pane $session pid "* ]] || continue
+		pid=${holder##* pid }
+		[ "$(readlink "/proc/$pid/fd/9" 2>/dev/null)" = "$envdir/$e.lock" ] || continue
+		wt=${holder%% (*}
+		name=${holder#"$wt ("}
+		name=${name%%) pane *}
+		kill "$pid" || continue
+		log released "$e" "${name:-$(basename "$wt")}" pane "$session" "(moved to $label)"
+		# The holder ends asynchronously; the acquire that follows should find this env free.
+		for _ in {1..50}; do flock -n "$envdir/$e.lock" true 2>/dev/null && break; sleep 0.1; done
+	done
+}
+
+# Prints the pool in the order acquire tries it: envs with the needed attributes before the rest, then envs with the wanted ones, then envs whose holder names this worktree. Envs that still have to be created come after all the others, because creating takes minutes.
 # Without envpool_configure an env that lacks a needed pair is left out.
 try_order() {
-	local e r attrs n w h
+	local e r attrs n w h m
 	local -A tier
 	for e in "${all[@]}"; do
-		attrs='' n=0 w=0 h=0
-		[ $((${#need[@]} + ${#want[@]})) -eq 0 ] || attrs=$(describe "$e")
+		attrs='' n=0 w=0 h=0 m=0
+		! is_missing "$e" || m=8
+		[ $((${#need[@]} + ${#want[@]})) -eq 0 ] || [ "$m" -ne 0 ] || attrs=$(describe "$e")
 		has_all "$attrs" "${need[@]}" || n=4
 		has_all "$attrs" "${want[@]}" || w=2
 		[[ $(cat "$envdir/$e.holder" 2>/dev/null) == "$worktree ("* ]] || h=1
-		tier[$e]=$((n + w + h))
+		tier[$e]=$((n + w + h + m))
 	done
-	for r in 0 1 2 3 4 5 6 7; do
-		if [ "$r" -ge 4 ] && ! declare -F envpool_configure >/dev/null; then break; fi
+	for r in {0..15}; do
+		if [ $((r % 8)) -ge 4 ] && ! declare -F envpool_configure >/dev/null; then continue; fi
 		for e in "${all[@]}"; do
 			if [ "${tier[$e]}" = "$r" ]; then echo "$e"; fi
 		done
@@ -324,8 +378,9 @@ try_order() {
 
 # Leaves the lease on fd 9 and its env name in $e; exits 75 when none frees up within $1 seconds.
 acquire() {
-	local deadline=$((SECONDS + $1)) grow_failed='' mismatch='' rc q=() order=() asks=("${need[@]/#/need=}" "${want[@]/#/want=}")
-	qentry="$queue/$(date +%s%N).$$"
+	local deadline=$((SECONDS + $1)) grow_failed='' mismatch='' rc q=() order=() asks=("${need[@]/#/need=}" "${want[@]/#/want=}" ${urgent:+urgent})
+	# A leading 0 sorts an urgent entry before every timestamp, and urgent entries keep their timestamp order among themselves.
+	qentry="$queue/${urgent:+0}$(date +%s%N).$$"
 	echo "$worktree ($branch) pid $$" >"$qentry"
 	# Names the hook that is running, so the EXIT trap can log it when set -e ends the script.
 	stage=''
@@ -342,7 +397,7 @@ acquire() {
 				if flock -n 9; then
 					# A shrink drops a name from the pool while it holds the lock, so a name that is gone is not leasable.
 					load_envs
-					if [[ " ${all[*]} " == *" $e "* ]]; then
+					if [[ " ${all[*]} " == *" $e "* ]] && create_missing "$e" "$1"; then
 						# The env may have changed since it was ranked, so the needs are checked again under the lock.
 						mismatch=''
 						needs_met "$e" || mismatch=1
@@ -399,6 +454,7 @@ acquire() {
 	echo "envlock: using $e" >&2 || true
 	echo "$e"
 	show_info "$e"
+	trim_log
 	headroom || shrink_in_background
 }
 
@@ -406,9 +462,14 @@ cmd=${1:-}; shift || true
 case "$cmd" in
 status)
 	load_envs
-	busy=0
+	busy=0 absent=0
 	lines=()
 	for e in "${all[@]}"; do
+		if is_missing "$e"; then
+			absent=$((absent + 1))
+			lines+=("$e  not created")
+			continue
+		fi
 		attrs=$(describe "$e")
 		if flock -n "$envdir/$e.lock" true 2>/dev/null; then
 			susp=''
@@ -420,8 +481,8 @@ status)
 		fi
 	done
 	mapfile -t q < <(queue_entries)
-	echo "$busy/${#all[@]} in use, $((${#all[@]} - busy)) free, ${#q[@]} queued, cap ${ENVPOOL_MAX:-none}"
-	printf '%s\n' "${lines[@]}"
+	echo "$busy/${#all[@]} in use, $((${#all[@]} - busy - absent)) free, ${#q[@]} queued, cap ${ENVPOOL_MAX:-none}"
+	[ "${#lines[@]}" -eq 0 ] || printf '%s\n' "${lines[@]}"
 	for i in "${!q[@]}"; do
 		echo "queued $((i + 1))  $(cat "${q[$i]}" 2>/dev/null || true)"
 	done
@@ -430,11 +491,12 @@ status)
 acquire)
 	# A caller that closes the pipe (`| head -1`) then makes writes fail instead of killing envlock mid-attach with SIGPIPE.
 	trap '' PIPE
-	wait=0
+	wait=0 urgent=''
 	need=() want=()
 	while [ $# -gt 0 ]; do
 		case "$1" in
 		--wait) wait=$2; shift 2 ;;
+		--urgent) urgent=1; shift ;;
 		--need | --want)
 			[[ ${2:-} == ?*=?* ]] || { echo "envlock: $1 needs key=value" >&2; exit 2; }
 			if [ "$1" = --need ]; then need+=("$2"); else want+=("$2"); fi
@@ -458,6 +520,7 @@ acquire)
 		show_info "$lease_env"
 		exit 0
 	fi
+	release_pane_lease
 	acquire "$wait"
 	;;
 env)
