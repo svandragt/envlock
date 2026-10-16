@@ -1,4 +1,4 @@
-<img align="right" src="docs/icon.svg" width="128" height="128" alt="Three books on a shelf, one lifted out with a lending tag">
+<img align="left" src="docs/icon.svg" width="128" height="128" alt="Three books on a shelf, one lifted out with a lending tag">
 
 # envlock
 
