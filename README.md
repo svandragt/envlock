@@ -75,7 +75,9 @@ envpool_configure() { ...; } # change $ENVLOCK_ENV to the key=value pairs in "$@
 envpool_info() { ...; }      # print a hint for the agent after each acquire, for example a login URL for $ENVLOCK_ENV
 ```
 
-Only `ENVS` is required. Leave out `ENVPOOL_MAX` and `envpool_create` to keep the pool a fixed size. With `envpool_exists` and `envpool_create`, envlock creates a name in `ENVS` that does not exist yet when an agent first leases it. With `ENVPOOL_MAX`, `ENVPOOL_PREFIX` and `envpool_create`, `ENVS=()` is valid and the pool grows from zero. Both ways of creating an environment need `acquire --wait`, because building an environment takes minutes. [`examples/vip.envpool`](examples/vip.envpool) is a complete example for VIP dev-env sites, and [`examples/altis.envpool`](examples/altis.envpool) for Altis local-server sites.
+Only `ENVS` is required. Leave out `ENVPOOL_MAX` and `envpool_create` to keep the pool a fixed size. With `envpool_exists` and `envpool_create`, envlock creates a name in `ENVS` that does not exist yet when an agent first leases it. With `ENVPOOL_MAX`, `ENVPOOL_PREFIX` and `envpool_create`, `ENVS=()` is valid and the pool grows from zero. Both ways of creating an environment need `acquire --wait`, because building an environment takes minutes. [`examples/vip.envpool`](examples/vip.envpool) is a complete example for VIP dev-env sites, [`examples/altis.envpool`](examples/altis.envpool) for Altis local-server sites and [`examples/ddev.envpool`](examples/ddev.envpool) for DDEV WordPress sites.
+
+VIP dev-env, Altis local-server and DDEV each run a proxy on ports 80 and 443, so you can run the pools of only one of them at a time. Stop the other platforms' environments first.
 
 envlock remembers which worktree it last switched each environment to. When the same worktree comes back, envlock skips `envpool_attach`, as long as `envpool_healthy` returns 0 or does not exist. If `envpool_attach` fails, envlock forgets the switch and runs it again next time.
 
@@ -101,6 +103,22 @@ Each worktree needs its own `composer install`. The attach step runs it when the
 The example runs Composer through the main checkout's devbox. If `composer` is on your `PATH`, delete the `composer()` function.
 
 The WordPress and PHP versions come from each worktree's code, so the example has no `envpool_describe` and `--need` and `--want` do not apply. Agents run wp-cli through the `docker exec` command that `envpool_info` prints after each acquire.
+
+#### Set up a pool for a DDEV site
+
+1. Copy [`examples/ddev.envpool`](examples/ddev.envpool) to `.envpool` in the main checkout, and add `.envpool` to `.git/info/exclude`.
+2. Set `ENVPOOL_SEED` to the DDEV project name of the main checkout, which `ddev list` shows. New environments copy its database.
+3. Set `ENVS` to one new name, such as `my-project2`, and `ENVPOOL_PREFIX` to `my-project`. Use lowercase letters, digits and dashes: the name becomes the site's address, `https://my-project2.ddev.site`.
+4. Git-ignore `wp-config.php` and `wp-config-ddev.php` in the project. DDEV writes its own copies into each worktree it starts, and tracked copies would show as changes.
+5. Run `envlock acquire --wait 3600` from a worktree. envlock creates `my-project2`, which takes about half a minute, and then leases it.
+
+The main checkout cannot lease an environment. DDEV allows one project name per directory, and the seed uses the main checkout's. Run `envlock acquire` from a worktree.
+
+A worktree that has a `composer.json` needs its own `composer install`. The attach step runs it when the worktree has no `vendor` directory.
+
+Each environment is a DDEV project named after the environment. Attaching moves the project to the worktree and keeps its database, so `ddev` commands work from the leased worktree. Agents run wp-cli with the `ddev wp --allow-root <command>` that `envpool_info` prints after each acquire. The example assumes DDEV's default router ports and `ddev.site` domain.
+
+The worktree's `.ddev/config.yaml` sets the PHP and database versions, so the example has no `envpool_describe` and `--need` and `--want` do not apply.
 
 ### Lease an environment
 

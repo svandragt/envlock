@@ -1,0 +1,142 @@
+# envlock pool for this repo (untracked: see .git/info/exclude).
+# shellcheck disable=SC2034,SC2015  # envlock reads ENVS, ENVPOOL_PREFIX and ENVPOOL_MAX, and the create chain ends in || on purpose.
+# Change these lines for your project. The rest stays the same for any DDEV WordPress site with a MariaDB or MySQL database.
+# An env name is also its DDEV project name, served at https://<name>.ddev.site on DDEV's default router ports. Use lowercase letters, digits and dashes.
+# The seed env is the DDEV project of the main checkout. It stays out of the pool. New envs copy its database.
+# The main checkout never leases an env: DDEV allows one project name per directory, and the seed holds that directory.
+ENVPOOL_SEED=my-project
+# envlock creates a name listed here that does not exist yet, on the first acquire with --wait.
+ENVS=(my-project2)
+# envlock grows the pool with envpool_create up to ENVPOOL_MAX envs, named ${ENVPOOL_PREFIX}N.
+ENVPOOL_PREFIX=my-project
+ENVPOOL_MAX=3
+
+# The git-ignored wp-config.php and wp-config-ddev.php of the main checkout are not in a new worktree. ddev start writes them there.
+ENVPOOL_MAIN=$(dirname "$(realpath "${BASH_SOURCE[0]}")")
+# DDEV merges this file over .ddev/config.yaml, so it gives the worktree's DDEV project the env's name. DDEV's own .ddev/.gitignore ignores it, so git sees no change.
+ENVPOOL_OVERRIDE=.ddev/config.envlock.local.yaml
+
+# There is no envpool_describe or envpool_configure: the worktree's .ddev/config.yaml sets PHP and the database, so both follow the code.
+
+envpool_up() { [ "$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 "https://$1.ddev.site/")" = 200 ]; }
+
+# The router answers 404 for a host it does not route yet.
+envpool_wait_up() {
+	for _ in $(seq 60); do
+		envpool_up "$1" && return 0
+		sleep 2
+	done
+	return 1
+}
+
+# Prints the directory DDEV has registered for project $1, only when it has status $2 if given. It prints nothing for a project DDEV has forgotten.
+envpool_approot() {
+	ddev list -j 2>/dev/null | jq -r --arg n "$1" --arg s "${2:-}" '.raw[] | select(.name == $n and ($s == "" or .status == $s)) | .approot'
+}
+
+# Runs wp-cli in env $1 from its own directory, so the env must be running: ddev wp starts a stopped env, and ddev exec -p does too.
+# --allow-root is for rootless Docker, where the container user is root.
+envpool_wp() {
+	local env=$1 dir
+	shift
+	dir=$(envpool_approot "$env" running) && [ -n "$dir" ] && (cd "$dir" && ddev wp --allow-root "$@")
+}
+
+# Removes what env $1 leaves in directory $2: the override and DDEV's router files for the env. .ddev/.gitignore lists the router files of the current name only, so git would see the old ones.
+envpool_tidy() { rm -f "$2/$ENVPOOL_OVERRIDE" "$2/.ddev/traefik/certs/$1".{crt,key} "$2/.ddev/traefik/config/$1.yaml"; }
+
+# Stops env $1 and makes DDEV forget its directory, which DDEV needs before it accepts the name in another directory. The database volume stays.
+envpool_unlist() {
+	local dir
+	dir=$(envpool_approot "$1") && { [ -z "$dir" ] || { ddev stop --unlist "$1" && envpool_tidy "$1" "$dir"; }; }
+}
+
+# Starts env $1 on the code in directory $2. It does not wait for the site: a new env has an empty database, and WordPress redirects every request to its installer.
+# DDEV allows one project name per directory, so it first forgets any other project in $2 and the old directory of $1. The database volume is keyed by the name, so it survives the move.
+envpool_start() {
+	local env=$1 dir=$2 other
+	if [ -f "$dir/composer.json" ] && [ ! -d "$dir/vendor" ]; then viv install -d "$dir" || return; fi
+	for other in $(ddev list -j 2>/dev/null | jq -r --arg d "$dir" --arg n "$env" '.raw[] | select(.approot == $d and .name != $n) | .name'); do
+		envpool_unlist "$other" || return
+	done
+	{ [ "$(envpool_approot "$env")" = "$dir" ] || envpool_unlist "$env"; } &&
+		printf 'name: %s\n' "$env" >"$dir/$ENVPOOL_OVERRIDE" &&
+		(cd "$dir" && ddev start)
+}
+
+# envlock records a successful switch and skips this while the record names the worktree and envpool_healthy passes.
+envpool_attach() {
+	[ "$(realpath "$ENVLOCK_WORKTREE")" != "$ENVPOOL_MAIN" ] ||
+		{ echo "envpool_attach: $ENVLOCK_ENV cannot run in the main checkout, where $ENVPOOL_SEED runs. Run acquire from a worktree." >&2; return 1; }
+	envpool_start "$ENVLOCK_ENV" "$ENVLOCK_WORKTREE" && envpool_wait_up "$ENVLOCK_ENV"
+}
+
+# Stops a spare env to save memory. The next acquire runs envpool_attach, which starts it again.
+# A stopped env is already in the wanted state, and an env DDEV has forgotten has no containers, so this succeeds for both.
+envpool_suspend() { [ -z "$(envpool_approot "$ENVLOCK_ENV")" ] || ddev stop "$ENVLOCK_ENV"; }
+
+envpool_healthy() { [ "$(envpool_approot "$ENVLOCK_ENV" running)" = "$ENVLOCK_WORKTREE" ] && envpool_up "$ENVLOCK_ENV"; }
+
+# A stopped env makes envpool_wp fail, which || true tolerates, and nothing here starts it.
+envpool_reset() {
+	local flags=()
+	envpool_wp "$ENVLOCK_ENV" core is-installed --network 2>/dev/null && flags=(--network)
+	envpool_wp "$ENVLOCK_ENV" cache flush "${flags[@]}" || true
+}
+
+# An env that DDEV has forgotten still has its database volume, so the volume decides.
+envpool_exists() { [ -n "$(docker volume ls -q --filter "label=com.docker.compose.project=ddev-$1")" ]; }
+
+# ddev wp works from a leased worktree because the override file names the env there.
+envpool_info() {
+	echo "https://$ENVLOCK_ENV.ddev.site/"
+	echo "wp-cli: ddev wp --allow-root <command>  (from this worktree)"
+}
+
+# DDEV sets the database user and password to db.
+envpool_table_count() {
+	ddev exec -p "$1" -s db mysql -udb -pdb -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='db'"
+}
+
+envpool_tables_match() {
+	local seed new
+	seed=$(envpool_table_count "$ENVPOOL_SEED") && new=$(envpool_table_count "$1") && [ "$seed" -gt 0 ] && [ "$seed" = "$new" ]
+}
+
+envpool_clone_db() {
+	(set -o pipefail; ddev export-db "$ENVPOOL_SEED" --gzip=false | ddev import-db "$1")
+}
+
+# envlock calls this for grown envs only, when no live worktree uses them and another env is free.
+# Gone means no containers and no volumes, so a repeated destroy also succeeds. ddev delete -O skips the snapshot, and it also removes an env that DDEV has forgotten.
+envpool_destroy() {
+	local label="label=com.docker.compose.project=ddev-$ENVLOCK_ENV" dir left
+	dir=$(envpool_approot "$ENVLOCK_ENV") || return
+	ddev delete -Oy "$ENVLOCK_ENV" || true
+	[ -z "$dir" ] || envpool_tidy "$ENVLOCK_ENV" "$dir"
+	left=$(docker ps -aq --filter "$label" && docker volume ls -q --filter "$label") && [ -z "$left" ]
+}
+
+# Clones the seed env into $ENVLOCK_ENV, so the new env never starts with an empty database.
+# The main checkout cannot host a second project, so the new env starts from a temporary worktree of its HEAD, which has the seed's committed code. DDEV forgets the env at the end, and attach starts it where it is leased.
+# envlock calls this inside an if, where set -e is off, so every step is chained with && and a failure destroys the half-built env.
+envpool_create() {
+	local new=$ENVLOCK_ENV tmp="" net=()
+	ddev start "$ENVPOOL_SEED" &&
+		tmp=$(mktemp -d) &&
+		git -C "$ENVPOOL_MAIN" worktree add -q --detach "$tmp" HEAD &&
+		envpool_start "$new" "$tmp" &&
+		envpool_clone_db "$new" &&
+		envpool_tables_match "$new" &&
+		{ envpool_wp "$new" core is-installed --network 2>/dev/null && net=(--network) || true; } &&
+		envpool_wp "$new" search-replace "$ENVPOOL_SEED.ddev.site" "$new.ddev.site" "${net[@]}" --all-tables --precise --report-changed-only --format=count &&
+		envpool_wp "$new" cache flush "${net[@]}" &&
+		envpool_unlist "$new" &&
+		git -C "$ENVPOOL_MAIN" worktree remove --force "$tmp" ||
+		{
+			echo "envpool_create: $new failed, destroying it" >&2
+			envpool_destroy
+			[ -z "$tmp" ] || { rm -rf "$tmp"; git -C "$ENVPOOL_MAIN" worktree prune; }
+			return 1
+		}
+}

@@ -1,4 +1,5 @@
 # envlock pool for this repo (untracked: see .git/info/exclude).
+# shellcheck disable=SC2034,SC2015  # envlock reads ENVS, ENVPOOL_PREFIX and ENVPOOL_MAX, and the create chain ends in || on purpose.
 # Change these lines for your project. The rest stays the same for any VIP dev-env site.
 # The seed env serves the main checkout and stays out of the pool. New envs copy its versions and database.
 ENVPOOL_SEED=site
@@ -16,27 +17,55 @@ ENVPOOL_MEDIA_DOMAIN=https://www.example.org
 ENVPOOL_MAIN=$(dirname "$(realpath "${BASH_SOURCE[0]}")")
 vip() { (cd "$ENVPOOL_MAIN" && devbox run -- vip "$@"); }
 
+# -L: a site that redirects its home page is up once the redirect target answers.
+envpool_up() { [ "$(curl -skL -o /dev/null -w '%{http_code}' --max-time 5 "https://$1.vipdev.lndo.site/")" = 200 ]; }
+
+# The proxy answers 404 for the env's hostname until the site is up, so attach waits for 200.
+envpool_wait_up() {
+	for _ in $(seq 60); do
+		envpool_up "$1" && return 0
+		sleep 2
+	done
+	return 1
+}
+
+envpool_wp() {
+	local env=$1
+	shift
+	vip dev-env exec --slug="$env" --quiet -- wp "$@"
+}
+
 # envlock records a successful switch and skips this while the record names the worktree and envpool_healthy passes.
 envpool_attach() {
-	[ -d "$ENVLOCK_WORKTREE/vendor" ] || viv install -d "$ENVLOCK_WORKTREE"
+	if [ -f "$ENVLOCK_WORKTREE/composer.json" ] && [ ! -d "$ENVLOCK_WORKTREE/vendor" ]; then viv install -d "$ENVLOCK_WORKTREE"; fi
 	vip dev-env update --slug="$ENVLOCK_ENV" --app-code="$ENVLOCK_WORKTREE"
 	vip dev-env start --slug="$ENVLOCK_ENV" --skip-wp-versions-check
+	envpool_wait_up "$ENVLOCK_ENV"
 }
 
 # Stops a spare env to save memory. The next acquire runs envpool_attach, which starts it again.
 envpool_suspend() { vip dev-env stop --slug="$ENVLOCK_ENV"; }
 
-envpool_healthy() { [ "$(docker inspect -f '{{.State.Running}}' "$ENVLOCK_ENV-php-1" 2>/dev/null)" = true ]; }
+envpool_running() { [ "$(docker inspect -f '{{.State.Running}}' "$ENVLOCK_ENV-php-1" 2>/dev/null)" = true ]; }
 
+envpool_healthy() {
+	[ "$(jq -r '.appCode.dir // empty' "$HOME/.local/share/vip/dev-environment/$ENVLOCK_ENV/instance_data.json" 2>/dev/null)" = "$ENVLOCK_WORKTREE" ] && envpool_running && envpool_up "$ENVLOCK_ENV"
+}
+
+# A suspended env stays stopped, and a flush that fails on it is harmless, so skip it. multisite is false, true or "subdirectory".
 envpool_reset() {
-	vip dev-env exec --slug="$ENVLOCK_ENV" --quiet -- wp cache flush --network || true
+	local flags=()
+	envpool_running || return 0
+	jq -e .multisite "$HOME/.local/share/vip/dev-environment/$ENVLOCK_ENV/instance_data.json" >/dev/null && flags=(--network)
+	envpool_wp "$ENVLOCK_ENV" cache flush "${flags[@]}" || true
 }
 
 envpool_exists() { [ -e "$HOME/.local/share/vip/dev-environment/$1" ]; }
 
-# Prints an https URL that logs in to wp-admin on its own. It must be https: over http a headless browser gets an http-only cookie, and its next https admin request bounces to the login page.
+# Prints an https URL that logs in to wp-admin on its own, then the wp-cli command. It must be https: over http a headless browser gets an http-only cookie, and its next https admin request bounces to the login page.
 envpool_info() {
 	jq -er --arg env "$ENVLOCK_ENV" '(.autologinKey // empty) as $k | "https://\($env).vipdev.lndo.site/wp-admin/?vip-dev-autologin=\($k)"' "$HOME/.local/share/vip/dev-environment/$ENVLOCK_ENV/instance_data.json"
+	echo "wp-cli: vip dev-env exec --slug=$ENVLOCK_ENV --quiet -- wp <command>"
 }
 
 # Prints the attributes envlock matches --need and --want against, for example: wp=7.1 php=8.4
@@ -92,7 +121,7 @@ envpool_create() {
 		vip dev-env start --slug="$new" --skip-wp-versions-check &&
 		envpool_clone_db "$new" &&
 		envpool_tables_match "$new" &&
-		vip dev-env exec --slug="$new" --quiet -- wp search-replace "$ENVPOOL_SEED.vipdev.lndo.site" "$new.vipdev.lndo.site" --network --all-tables --precise --report-changed-only --format=count &&
-		vip dev-env exec --slug="$new" --quiet -- wp cache flush --network ||
+		envpool_wp "$new" search-replace "$ENVPOOL_SEED.vipdev.lndo.site" "$new.vipdev.lndo.site" --network --all-tables --precise --report-changed-only --format=count &&
+		envpool_wp "$new" cache flush --network ||
 		{ echo "envpool_create: $new failed, destroying it" >&2; vip dev-env destroy --slug="$new" || true; return 1; }
 }

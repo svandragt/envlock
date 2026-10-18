@@ -39,7 +39,7 @@ envpool_wp() {
 # The start recreates only the containers that mount the code, so the database survives a move to another worktree.
 envpool_start() {
 	local env=$1 dir=$2
-	[ -d "$dir/vendor" ] || viv install -d "$dir" || return
+	if [ -f "$dir/composer.json" ] && [ ! -d "$dir/vendor" ]; then viv install -d "$dir" || return; fi
 	(
 		bak=$(mktemp -d) && cp "$dir/composer.json" "$bak/" && { [ ! -e "$dir/vendor/host" ] || cp "$dir/vendor/host" "$bak/"; } || exit
 		trap 'cp "$bak/composer.json" "$dir/composer.json"; if [ -e "$bak/host" ]; then cp "$bak/host" "$dir/vendor/host"; else rm -f "$dir/vendor/host"; fi; rm -rf "$bak"' EXIT
@@ -60,7 +60,12 @@ envpool_healthy() {
 	[ "$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/usr/src/app"}}{{.Source}}{{end}}{{end}}' "$ENVLOCK_ENV-php" 2>/dev/null)" = "$ENVLOCK_WORKTREE" ] && envpool_up "$ENVLOCK_ENV"
 }
 
-envpool_reset() { envpool_wp "$ENVLOCK_ENV" cache flush --network || true; }
+# A stopped env makes docker exec fail, which || true tolerates, and nothing here starts it.
+envpool_reset() {
+	local flags=()
+	envpool_wp "$ENVLOCK_ENV" core is-installed --network 2>/dev/null && flags=(--network)
+	envpool_wp "$ENVLOCK_ENV" cache flush "${flags[@]}" || true
+}
 
 envpool_exists() { docker volume inspect "$1_db-data" >/dev/null 2>&1; }
 

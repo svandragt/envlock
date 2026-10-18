@@ -8,6 +8,7 @@ Guidance for coding agents working in this repository. `README.md` covers what e
 - `skills/ticket-fleet/SKILL.md`: a Claude Code skill that starts a herdr worktree and session per ticket. `~/.claude/skills/ticket-fleet` is a symlink to it.
 - `examples/vip.envpool`: an anonymised copy of a real pool config for VIP dev-env sites. The real file lives untracked in that project's main checkout.
 - `examples/altis.envpool`: a pool config for Altis local-server sites. It was tested against a throwaway sandbox, not a real project.
+- `examples/ddev.envpool`: a pool config for DDEV WordPress sites. It was tested against a throwaway sandbox, not a real project.
 - `tests/`: the test suite. `tests/run` runs every `t-*.sh` suite, `tests/lib.sh` holds their shared helpers and `tests/bin/herdr` is the stub herdr.
 
 ## How a lease works
@@ -61,24 +62,29 @@ Every platform example in `examples/` gives agents the same behaviour, so a tick
 
 - Gives each env its own stack and database, served at a hostname that contains the env name. Envs share only the platform's proxy.
 - Attaches by pointing the env at the worktree's code and keeping its database, so a lease gets the database as the previous lease left it.
-- Runs `viv install` in `envpool_attach` when the worktree has no `vendor` directory.
+- Returns from `envpool_attach` only once the site answers 200, so the agent's first request reaches WordPress and not a proxy's 404.
+- Runs `viv install` in `envpool_attach` when the worktree has a `composer.json` and no `vendor` directory.
 - Leaves the worktree's tracked files as they were, so git sees no change after an attach.
-- Flushes the object cache across the network in `envpool_reset`, and tolerates a stopped env.
+- Returns 0 from `envpool_healthy` only when the env runs, serves this worktree's code and answers 200.
+- Flushes the whole object cache in `envpool_reset`, with `--network` on multisite, and tolerates a stopped env without starting it.
 - Stops the env in `envpool_suspend`, succeeds when it is already stopped, and lets `envpool_attach` start it again.
 - Reports a stopped env as existing in `envpool_exists`.
 - Creates an env by cloning the seed's database, compares table counts, and destroys the half-built env when any step fails.
 - Removes everything the env owns in `envpool_destroy`, and succeeds when it is already gone.
-- Prints the site URL in `envpool_info`, and the wp-cli command when the platform's own command does not work from a leased worktree.
+- Prints two lines in `envpool_info`: the site URL, or an autologin URL where the platform has one, and then `wp-cli: <command>`, the exact command an agent runs wp-cli with from the leased worktree.
+- Names its helpers `envpool_up`, `envpool_wait_up`, `envpool_wp`, `envpool_table_count`, `envpool_tables_match` and `envpool_clone_db`, as the other examples do.
+
+Every platform's proxy binds host ports 80 and 443, so the pools of only one platform can run on a machine at a time.
 
 The platforms may differ only where the platform forces it:
 
-| | VIP dev-env | Altis local-server |
-|---|---|---|
-| WordPress and PHP versions | The env owns them, so `envpool_describe` and `envpool_configure` exist and `--need` works | The worktree's `composer.json` sets them, so `--need` and `--want` do not apply |
-| Attach | `vip dev-env update --app-code` repoints the env | The hook writes the env name into the worktree's `composer.json` for one `composer server start` and restores it |
-| `envpool_healthy` | The php container runs | The php container mounts this worktree and the site returns 200 |
-| Login | `envpool_info` prints an autologin URL | The seed's users, copied with its database |
-| wp-cli | `vip dev-env exec` | `docker exec` into the env's php container |
+| | VIP dev-env | Altis local-server | DDEV |
+|---|---|---|---|
+| WordPress and PHP versions | The env owns them, so `envpool_describe` and `envpool_configure` exist and `--need` works | The worktree's `composer.json` sets them, so `--need` and `--want` do not apply | The worktree's `.ddev/config.yaml` sets PHP and the database, so `--need` and `--want` do not apply |
+| Attach | `vip dev-env update --app-code` repoints the env | The hook writes the env name into the worktree's `composer.json` for one `composer server start` and restores it | The hook writes an override file that names the env into the worktree's `.ddev/`, and runs `ddev stop --unlist` for the env's old directory first |
+| Login | `envpool_info` prints an autologin URL | The seed's users, copied with its database | The seed's users, copied with its database |
+| wp-cli | `vip dev-env exec` | `docker exec` into the env's php container | `ddev wp --allow-root`, run from the leased worktree |
+| Main checkout | Can lease | Can lease | Cannot lease: the seed's registration holds that directory, and DDEV allows one project name per directory |
 
 ## Writing .envpool hooks
 
@@ -93,6 +99,7 @@ The platforms may differ only where the platform forces it:
 - `envpool_attach` runs as a plain command, so `set -e` applies inside it and a failing step aborts `acquire` with no attach record. It must always do the full switch, because envlock decides when to skip it.
 - `envpool_info` is optional and sees `ENVLOCK_ENV` and `ENVLOCK_WORKTREE`. `acquire` runs it after every successful acquire, new lease or reuse, once the env name is on stdout. Its stdout goes to stderr, so `name=$(envlock acquire)` gets only the name. A failing hook is ignored, because the lease is already taken. The VIP example prints the https autologin URL: over http a headless browser gets an http-only cookie, and its next https admin request bounces to the login page.
 - The Altis example gives each env a local-server name, which is the env name. local-server reads the stack name only from `extra.altis.modules.local-server.name` in the composer.json of the directory it runs in, else from that directory's name, and its `start` refuses when `vendor/host` names another host. So `envpool_attach` writes the name into the worktree's `composer.json`, deletes `vendor/host`, runs `composer server start`, and restores both files byte for byte in a subshell `EXIT` trap, which also runs when the start fails under `set -e`. The name stays out of the worktree, so git sees no change and the next env started from it picks its own name. For the same reason `composer server cli` does not work from a leased worktree: with the name gone it looks for a stack named after the directory. Agents run wp-cli through `docker exec`, as `envpool_info` prints.
+- The DDEV example gives each env a DDEV project name, which is the env name. DDEV reads the name from `.ddev/config.yaml` with every `config.*.yaml` in that directory merged over it, and `ddev start` refuses a name that is registered at another directory. `ddev stop --unlist <name>` stops the env and makes DDEV forget its directory, and the database volume, which is keyed by the name, stays. So `envpool_attach` runs `ddev stop --unlist` for the env's old directory and for any other project registered at the worktree, writes `name: <env>` to `.ddev/config.envlock.local.yaml` in the worktree, and runs `ddev start`. DDEV's own `.ddev/.gitignore` lists `config.*.local.yaml`, so git sees no change. The directory that the env leaves loses its override and the env's router files in `.ddev/traefik`, because `.ddev/.gitignore` lists those for the current name only. `ddev wp` and `ddev exec` then work from the leased worktree, but they also start a stopped env, so `envpool_reset` looks up the env's status in `ddev list -j` first. The wp-cli calls use `--allow-root` because the container user is root on rootless Docker. The main checkout is refused in `envpool_attach`: the seed is registered there, and DDEV refuses a second name in that directory and fails the seed's own commands while the override file exists. `envpool_create` starts the new env from a temporary `git worktree add --detach` of the main checkout's HEAD, and ends with `ddev stop --unlist` so that `envpool_attach` starts it where it is leased. `envpool_start` does not wait for 200, because a new env has an empty database and WordPress redirects every request to its installer. `envpool_attach` waits.
 - `envpool_healthy` is optional and sees `ENVLOCK_ENV`. It returns 0 when the environment is up and serves its code. envlock asks it only when the attach record already names the worktree. Without it, the record alone decides.
 
 ## Testing
