@@ -65,7 +65,7 @@ Every platform example in `examples/` gives agents the same behaviour, so a tick
 - Returns from `envpool_attach` only once the site answers 200, so the agent's first request reaches WordPress and not a proxy's 404.
 - Runs `viv install` in `envpool_attach` when the worktree has a `composer.json` and no `vendor` directory.
 - Leaves the worktree's tracked files as they were, so git sees no change after an attach.
-- Returns 0 from `envpool_healthy` only when the env runs, serves this worktree's code and answers 200.
+- Returns 0 from `envpool_healthy` only when the env runs, serves this worktree's code and answers 200. Its request allows 20 seconds, because the first page after the reset's cache flush is slow.
 - Flushes the whole object cache in `envpool_reset`, with `--network` on multisite, and tolerates a stopped env without starting it.
 - Stops the env in `envpool_suspend`, succeeds when it is already stopped, and lets `envpool_attach` start it again.
 - Reports a stopped env as existing in `envpool_exists`.

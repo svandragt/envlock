@@ -18,7 +18,7 @@ ENVPOOL_OVERRIDE=.ddev/config.envlock.local.yaml
 
 # There is no envpool_describe or envpool_configure: the worktree's .ddev/config.yaml sets PHP and the database, so both follow the code.
 
-envpool_up() { [ "$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 "https://$1.ddev.site/")" = 200 ]; }
+envpool_up() { [ "$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 "https://$1.ddev.site/")" = 200 ]; }
 
 # The router answers 404 for a host it does not route yet.
 envpool_wait_up() {

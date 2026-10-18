@@ -17,7 +17,8 @@ composer() { (cd "$ENVPOOL_MAIN" && devbox run -- composer "$@"); }
 
 # There is no envpool_describe or envpool_configure: WordPress comes from the worktree's vendor and PHP from its composer.json, so both follow the code.
 
-envpool_up() { [ "$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 "https://$1.altis.dev/")" = 200 ]; }
+# The first request after envpool_reset's cache flush takes about 6 seconds, and envpool_healthy asks right after the reset.
+envpool_up() { [ "$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 "https://$1.altis.dev/")" = 200 ]; }
 
 # composer server start prints "Startup completed" about 10 seconds before nginx serves the site.
 envpool_wait_up() {
