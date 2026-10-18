@@ -1,0 +1,122 @@
+# envlock pool for this repo (untracked: see .git/info/exclude).
+# shellcheck disable=SC2034,SC2015  # envlock reads ENVS, ENVPOOL_PREFIX and ENVPOOL_MAX, and the create chain ends in || on purpose.
+# Change these lines for your project. The rest stays the same for any Altis local-server site.
+# An env name is also its local-server name: the stack is <name>-php and so on, served at https://<name>.altis.dev. Use lowercase letters, digits and dashes.
+# The seed env serves the main checkout and stays out of the pool. New envs copy its database. It is named after the main checkout's directory, or after extra.altis.modules.local-server.name in composer.json.
+ENVPOOL_SEED=my-project
+# envlock creates a name listed here that does not exist yet, on the first acquire with --wait.
+ENVS=(my-project2)
+# envlock grows the pool with envpool_create up to ENVPOOL_MAX envs, named ${ENVPOOL_PREFIX}N.
+ENVPOOL_PREFIX=my-project
+ENVPOOL_MAX=3
+
+# composer runs in the main checkout's devbox; worktree devboxes may lack it. Delete this function if composer is on PATH.
+# Callers pass -d <dir>, so the directory this runs in does not matter.
+ENVPOOL_MAIN=$(dirname "$(realpath "${BASH_SOURCE[0]}")")
+composer() { (cd "$ENVPOOL_MAIN" && devbox run -- composer "$@"); }
+
+# There is no envpool_describe or envpool_configure: WordPress comes from the worktree's vendor and PHP from its composer.json, so both follow the code.
+
+envpool_up() { [ "$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 "https://$1.altis.dev/")" = 200 ]; }
+
+# composer server start prints "Startup completed" about 10 seconds before nginx serves the site.
+envpool_wait_up() {
+	for _ in $(seq 60); do
+		envpool_up "$1" && return 0
+		sleep 2
+	done
+	return 1
+}
+
+envpool_wp() {
+	local env=$1
+	shift
+	docker exec -u "$(id -u)" "$env-php" wp --url="$env.altis.dev" "$@"
+}
+
+# Starts env $1 on the code in directory $2, then puts composer.json and vendor/host back as they were.
+# local-server takes the stack name from composer.json, and refuses to start when vendor/host names another host, so both change for the start.
+# The start recreates only the containers that mount the code, so the database survives a move to another worktree.
+envpool_start() {
+	local env=$1 dir=$2
+	[ -d "$dir/vendor" ] || viv install -d "$dir" || return
+	(
+		bak=$(mktemp -d) && cp "$dir/composer.json" "$bak/" && { [ ! -e "$dir/vendor/host" ] || cp "$dir/vendor/host" "$bak/"; } || exit
+		trap 'cp "$bak/composer.json" "$dir/composer.json"; if [ -e "$bak/host" ]; then cp "$bak/host" "$dir/vendor/host"; else rm -f "$dir/vendor/host"; fi; rm -rf "$bak"' EXIT
+		jq --arg n "$env" '.extra.altis.modules."local-server".name = $n' "$bak/composer.json" >"$dir/composer.json" &&
+			rm -f "$dir/vendor/host" &&
+			composer -d "$dir" server start
+	) && envpool_wait_up "$env"
+}
+
+# envlock records a successful switch and skips this while the record names the worktree and envpool_healthy passes.
+envpool_attach() { envpool_start "$ENVLOCK_ENV" "$ENVLOCK_WORKTREE"; }
+
+# Stops a spare env to save memory. The next acquire runs envpool_attach, which starts it again.
+# A stopped env is already in the wanted state, so this also succeeds for one.
+envpool_suspend() { docker compose -p "$ENVLOCK_ENV" stop; }
+
+envpool_healthy() {
+	[ "$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/usr/src/app"}}{{.Source}}{{end}}{{end}}' "$ENVLOCK_ENV-php" 2>/dev/null)" = "$ENVLOCK_WORKTREE" ] && envpool_up "$ENVLOCK_ENV"
+}
+
+envpool_reset() { envpool_wp "$ENVLOCK_ENV" cache flush --network || true; }
+
+envpool_exists() { docker volume inspect "$1_db-data" >/dev/null 2>&1; }
+
+# Agents run wp-cli through docker exec: composer server cli works only from the directory that started the env, which a leased worktree is not.
+envpool_info() {
+	echo "https://$ENVLOCK_ENV.altis.dev/"
+	echo "wp-cli: docker exec -u \"\$(id -u)\" $ENVLOCK_ENV-php wp --url=$ENVLOCK_ENV.altis.dev <command>"
+}
+
+# local-server sets the database root password to wordpress.
+envpool_table_count() {
+	docker exec -e MYSQL_PWD=wordpress "$1-db" mysql -uroot -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='wordpress'"
+}
+
+envpool_tables_match() {
+	local seed new
+	seed=$(envpool_table_count "$ENVPOOL_SEED") && new=$(envpool_table_count "$1") && [ "$seed" -gt 0 ] && [ "$seed" = "$new" ]
+}
+
+# Starts the seed's database container if it is stopped, and waits until it answers.
+envpool_seed_up() {
+	docker start "$ENVPOOL_SEED-db" >/dev/null || return
+	for _ in $(seq 30); do
+		envpool_table_count "$ENVPOOL_SEED" >/dev/null 2>&1 && return 0
+		sleep 2
+	done
+	return 1
+}
+
+envpool_clone_db() {
+	(set -o pipefail; docker exec -e MYSQL_PWD=wordpress "$ENVPOOL_SEED-db" mysqldump -uroot --single-transaction --quick --routines wordpress | docker exec -i -e MYSQL_PWD=wordpress "$1-db" mysql -uroot wordpress)
+}
+
+# envlock calls this for grown envs only, when no live worktree uses them and another env is free.
+# Gone means no containers and no volumes, so a repeated destroy also succeeds. The network goes too, because Docker runs out of address pools after about 30.
+envpool_destroy() {
+	local label="label=com.docker.compose.project=$ENVLOCK_ENV" left
+	(
+		set -o pipefail
+		docker ps -aq --filter "$label" | xargs -r docker rm -f >/dev/null &&
+			docker volume ls -q --filter "$label" | xargs -r docker volume rm >/dev/null &&
+			docker network ls -q --filter "$label" | xargs -r docker network rm >/dev/null
+	) &&
+		left=$(docker ps -aq --filter "$label" && docker volume ls -q --filter "$label") && [ -z "$left" ]
+}
+
+# Clones the seed env into $ENVLOCK_ENV, so the new env never starts with an empty database.
+# The new env starts from the main checkout, which serves the seed, so it has the seed's code. The first start installs a fresh WordPress.
+# envlock calls this inside an if, where set -e is off, so every step is chained with && and a failure destroys the half-built env.
+envpool_create() {
+	local new=$ENVLOCK_ENV
+	envpool_seed_up &&
+		envpool_start "$new" "$ENVPOOL_MAIN" &&
+		envpool_clone_db "$new" &&
+		envpool_tables_match "$new" &&
+		envpool_wp "$new" search-replace "$ENVPOOL_SEED.altis.dev" "$new.altis.dev" --network --all-tables --precise --report-changed-only --format=count &&
+		envpool_wp "$new" cache flush ||
+		{ echo "envpool_create: $new failed, destroying it" >&2; envpool_destroy; return 1; }
+}

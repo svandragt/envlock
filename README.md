@@ -75,7 +75,7 @@ envpool_configure() { ...; } # change $ENVLOCK_ENV to the key=value pairs in "$@
 envpool_info() { ...; }      # print a hint for the agent after each acquire, for example a login URL for $ENVLOCK_ENV
 ```
 
-Only `ENVS` is required. Leave out `ENVPOOL_MAX` and `envpool_create` to keep the pool a fixed size. With `envpool_exists` and `envpool_create`, envlock creates a name in `ENVS` that does not exist yet when an agent first leases it. With `ENVPOOL_MAX`, `ENVPOOL_PREFIX` and `envpool_create`, `ENVS=()` is valid and the pool grows from zero. Both ways of creating an environment need `acquire --wait`, because building an environment takes minutes. [`examples/vip.envpool`](examples/vip.envpool) is a complete example for VIP dev-env sites.
+Only `ENVS` is required. Leave out `ENVPOOL_MAX` and `envpool_create` to keep the pool a fixed size. With `envpool_exists` and `envpool_create`, envlock creates a name in `ENVS` that does not exist yet when an agent first leases it. With `ENVPOOL_MAX`, `ENVPOOL_PREFIX` and `envpool_create`, `ENVS=()` is valid and the pool grows from zero. Both ways of creating an environment need `acquire --wait`, because building an environment takes minutes. [`examples/vip.envpool`](examples/vip.envpool) is a complete example for VIP dev-env sites, and [`examples/altis.envpool`](examples/altis.envpool) for Altis local-server sites.
 
 envlock remembers which worktree it last switched each environment to. When the same worktree comes back, envlock skips `envpool_attach`, as long as `envpool_healthy` returns 0 or does not exist. If `envpool_attach` fails, envlock forgets the switch and runs it again next time.
 
@@ -88,6 +88,19 @@ envlock remembers which worktree it last switched each environment to. When the 
 5. Run `envlock acquire --wait 3600` from a worktree. envlock creates `my-site2`, which takes a few minutes, and then leases it.
 
 The example runs the `vip` CLI through the main checkout's devbox. If `vip` is on your `PATH`, delete the `vip()` function.
+
+#### Set up a pool for an Altis local-server site
+
+1. Copy [`examples/altis.envpool`](examples/altis.envpool) to `.envpool` in the main checkout, and add `.envpool` to `.git/info/exclude`.
+2. Set `ENVPOOL_SEED` to the name of the environment that serves the main checkout. That is the name of its directory, or `extra.altis.modules.local-server.name` in its `composer.json`. New environments copy its database.
+3. Set `ENVS` to one new name, such as `my-project2`, and `ENVPOOL_PREFIX` to `my-project`. Use lowercase letters, digits and dashes: the name becomes the site's address, `https://my-project2.altis.dev`.
+4. Run `envlock acquire --wait 3600` from a worktree. envlock creates `my-project2`, which takes about a minute, and then leases it.
+
+Each worktree needs its own `composer install`. The attach step runs it when the worktree has no `vendor` directory.
+
+The example runs Composer through the main checkout's devbox. If `composer` is on your `PATH`, delete the `composer()` function.
+
+The WordPress and PHP versions come from each worktree's code, so the example has no `envpool_describe` and `--need` and `--want` do not apply. Agents run wp-cli through the `docker exec` command that `envpool_info` prints after each acquire.
 
 ### Lease an environment
 
