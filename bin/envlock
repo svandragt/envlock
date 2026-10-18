@@ -18,11 +18,12 @@
 # such as a login URL, after every successful acquire, new lease or reuse.
 # envpool_suspend (sees ENVLOCK_ENV, same contract as envpool_destroy) stops a spare env
 # to save memory; the next acquire of it runs envpool_attach, which must start it.
+# envpool_fresh (sees ENVLOCK_ENV and ENVLOCK_WORKTREE) replaces the env's database with the seed's; acquire --fresh runs it after envpool_attach and on reuse.
 # Every hook runs with envlock's lock fds closed, so nothing a hook starts holds a lock.
 set -euo pipefail
 
 usage() {
-	echo "usage: envlock acquire [--wait SECONDS] [--urgent] [--need KEY=VALUE]... [--want KEY=VALUE]..." >&2
+	echo "usage: envlock acquire [--wait SECONDS] [--urgent] [--fresh] [--need KEY=VALUE]... [--want KEY=VALUE]..." >&2
 	echo "       envlock env" >&2
 	echo "       envlock release" >&2
 	echo "       envlock status" >&2
@@ -378,7 +379,7 @@ try_order() {
 
 # Leaves the lease on fd 9 and its env name in $e; exits 75 when none frees up within $1 seconds.
 acquire() {
-	local deadline=$((SECONDS + $1)) grow_failed='' mismatch='' rc q=() order=() asks=("${need[@]/#/need=}" "${want[@]/#/want=}" ${urgent:+urgent})
+	local deadline=$((SECONDS + $1)) grow_failed='' mismatch='' rc q=() order=() asks=("${need[@]/#/need=}" "${want[@]/#/want=}" ${urgent:+urgent} ${fresh:+fresh})
 	# A leading 0 sorts an urgent entry before every timestamp, and urgent entries keep their timestamp order among themselves.
 	qentry="$queue/${urgent:+0}$(date +%s%N).$$"
 	echo "$worktree ($branch) pid $$" >"$qentry"
@@ -445,6 +446,11 @@ acquire() {
 			printf '%s\n' "$worktree" >"$envdir/$e.attached"
 		fi
 	fi
+	if [ -n "$fresh" ]; then
+		stage=fresh
+		hook envpool_fresh >&2
+		log fresh "$e" "$label" pane "$session"
+	fi
 	stage=''
 	# The holder inherits fd 9 and keeps the lease until the wait that it runs as a child returns.
 	setsid bash -c "$(declare -p lockdir label; declare -f log session_wait_idle hold); hold \"\$@\"" _ "$e" "$session" </dev/null >>"$lockdir/holder.log" 2>&1 &
@@ -491,12 +497,13 @@ status)
 acquire)
 	# A caller that closes the pipe (`| head -1`) then makes writes fail instead of killing envlock mid-attach with SIGPIPE.
 	trap '' PIPE
-	wait=0 urgent=''
+	wait=0 urgent='' fresh=''
 	need=() want=()
 	while [ $# -gt 0 ]; do
 		case "$1" in
 		--wait) wait=$2; shift 2 ;;
 		--urgent) urgent=1; shift ;;
+		--fresh) fresh=1; shift ;;
 		--need | --want)
 			[[ ${2:-} == ?*=?* ]] || { echo "envlock: $1 needs key=value" >&2; exit 2; }
 			if [ "$1" = --need ]; then need+=("$2"); else want+=("$2"); fi
@@ -509,11 +516,22 @@ acquire)
 		[ "${#want[@]}" -eq 0 ] || echo "envlock: ignoring --want, .envpool has no envpool_describe" >&2 || true
 		want=()
 	fi
+	[ -z "$fresh" ] || declare -F envpool_fresh >/dev/null || { echo "envlock: --fresh requires envpool_fresh in .envpool" >&2; exit 1; }
 	session=$(session_id) || exit 1
 	if find_lease; then
 		if ! needs_met "$lease_env"; then
 			declare -F envpool_configure >/dev/null || { echo "envlock: $lease_env lacks ${need[*]} and .envpool has no envpool_configure; run envlock release first" >&2; exit 1; }
 			run_configure "$lease_env" || exit 1
+		fi
+		if [ -n "$fresh" ]; then
+			rc=0
+			ENVLOCK_ENV=$lease_env ENVLOCK_WORKTREE=$worktree hook envpool_fresh >&2 || rc=$?
+			if [ "$rc" -ne 0 ]; then
+				log fresh-failed "$lease_env" "$label" pane "$session" "exit=$rc"
+				echo "envlock: refreshing $lease_env failed; the lease is unchanged" >&2
+				exit "$rc"
+			fi
+			log fresh "$lease_env" "$label" pane "$session"
 		fi
 		log reused "$lease_env" "$label" pane "$session"
 		echo "$lease_env"

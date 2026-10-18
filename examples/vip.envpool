@@ -98,8 +98,9 @@ envpool_tables_match() {
 	seed=$(envpool_table_count "$ENVPOOL_SEED") && new=$(envpool_table_count "$1") && [ "$seed" -gt 0 ] && [ "$seed" = "$new" ]
 }
 
+# --add-drop-database replaces the whole database, so a table that only the env has, such as one a migration added, goes too.
 envpool_clone_db() {
-	(set -o pipefail; docker exec "$ENVPOOL_SEED-database-1" mysqldump -uroot --single-transaction --quick --routines wordpress | docker exec -i "$1-database-1" mysql -uroot wordpress)
+	(set -o pipefail; docker exec "$ENVPOOL_SEED-database-1" mysqldump -uroot --single-transaction --quick --routines --databases wordpress --add-drop-database | docker exec -i "$1-database-1" mysql -uroot)
 }
 
 # envlock calls this for grown envs only, when no live worktree uses them and another env is free.
@@ -112,16 +113,27 @@ envpool_destroy() {
 	! envpool_exists "$ENVLOCK_ENV" && [ -z "$(docker ps -aq --filter "name=^$ENVLOCK_ENV-")" ]
 }
 
+# Replaces env $1's database with a copy of the seed's. The steps are chained with && because envpool_create calls this inside an if, where set -e is off.
+envpool_reseed() {
+	envpool_clone_db "$1" &&
+		envpool_tables_match "$1" &&
+		envpool_wp "$1" search-replace "$ENVPOOL_SEED.vipdev.lndo.site" "$1.vipdev.lndo.site" --network --all-tables --precise --report-changed-only --format=count &&
+		envpool_wp "$1" cache flush --network
+}
+
+# acquire --fresh runs this on a running env, so the agent starts from the seed's data.
+# The clone reads from the seed, so it must be running.
+envpool_seed_up() { vip dev-env start --slug="$ENVPOOL_SEED" --skip-wp-versions-check; }
+
+envpool_fresh() { envpool_seed_up && envpool_reseed "$ENVLOCK_ENV"; }
+
 # Clones the seed env into $ENVLOCK_ENV, so the new env never starts with an empty database.
 # envlock calls this inside an if, where set -e is off, so every step is chained with && and a failure destroys the half-built env.
 envpool_create() {
 	local new=$ENVLOCK_ENV data="$HOME/.local/share/vip/dev-environment/$ENVPOOL_SEED/instance_data.json" php wp
-	php=$(jq -er '.php | split(":")[-1]' "$data") && wp=$(jq -er .wordpress.tag "$data") &&
+	envpool_seed_up && php=$(jq -er '.php | split(":")[-1]' "$data") && wp=$(jq -er .wordpress.tag "$data") &&
 		vip dev-env create --slug="$new" --title="$ENVPOOL_TITLE ($new)" --multisite="$ENVPOOL_MULTISITE" --php="$php" --wordpress="$wp" --mu-plugins="$ENVPOOL_MU_PLUGINS" --app-code="$ENVPOOL_MAIN" --media-redirect-domain="$ENVPOOL_MEDIA_DOMAIN" --elasticsearch=n --phpmyadmin=n --xdebug=n --mailpit=n --photon=n --cron=n &&
 		vip dev-env start --slug="$new" --skip-wp-versions-check &&
-		envpool_clone_db "$new" &&
-		envpool_tables_match "$new" &&
-		envpool_wp "$new" search-replace "$ENVPOOL_SEED.vipdev.lndo.site" "$new.vipdev.lndo.site" --network --all-tables --precise --report-changed-only --format=count &&
-		envpool_wp "$new" cache flush --network ||
+		envpool_reseed "$new" ||
 		{ echo "envpool_create: $new failed, destroying it" >&2; vip dev-env destroy --slug="$new" || true; return 1; }
 }

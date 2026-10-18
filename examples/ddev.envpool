@@ -117,20 +117,31 @@ envpool_destroy() {
 	left=$(docker ps -aq --filter "$label" && docker volume ls -q --filter "$label") && [ -z "$left" ]
 }
 
+# Replaces env $1's database with a copy of the seed's. The steps are chained with && because envpool_create calls this inside an if, where set -e is off.
+envpool_reseed() {
+	local net=()
+	envpool_clone_db "$1" &&
+		envpool_tables_match "$1" &&
+		{ envpool_wp "$1" core is-installed --network 2>/dev/null && net=(--network) || true; } &&
+		envpool_wp "$1" search-replace "$ENVPOOL_SEED.ddev.site" "$1.ddev.site" "${net[@]}" --all-tables --precise --report-changed-only --format=count &&
+		envpool_wp "$1" cache flush "${net[@]}"
+}
+
+# acquire --fresh runs this on a running env, so the agent starts from the seed's data. A stopped seed has no database to copy.
+envpool_seed_up() { ddev start "$ENVPOOL_SEED"; }
+
+envpool_fresh() { envpool_seed_up && envpool_reseed "$ENVLOCK_ENV"; }
+
 # Clones the seed env into $ENVLOCK_ENV, so the new env never starts with an empty database.
 # The main checkout cannot host a second project, so the new env starts from a temporary worktree of its HEAD, which has the seed's committed code. DDEV forgets the env at the end, and attach starts it where it is leased.
 # envlock calls this inside an if, where set -e is off, so every step is chained with && and a failure destroys the half-built env.
 envpool_create() {
-	local new=$ENVLOCK_ENV tmp="" net=()
-	ddev start "$ENVPOOL_SEED" &&
+	local new=$ENVLOCK_ENV tmp=""
+	envpool_seed_up &&
 		tmp=$(mktemp -d) &&
 		git -C "$ENVPOOL_MAIN" worktree add -q --detach "$tmp" HEAD &&
 		envpool_start "$new" "$tmp" &&
-		envpool_clone_db "$new" &&
-		envpool_tables_match "$new" &&
-		{ envpool_wp "$new" core is-installed --network 2>/dev/null && net=(--network) || true; } &&
-		envpool_wp "$new" search-replace "$ENVPOOL_SEED.ddev.site" "$new.ddev.site" "${net[@]}" --all-tables --precise --report-changed-only --format=count &&
-		envpool_wp "$new" cache flush "${net[@]}" &&
+		envpool_reseed "$new" &&
 		envpool_unlist "$new" &&
 		git -C "$ENVPOOL_MAIN" worktree remove --force "$tmp" ||
 		{

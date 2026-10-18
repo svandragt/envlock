@@ -96,8 +96,9 @@ envpool_seed_up() {
 	return 1
 }
 
+# --add-drop-database replaces the whole database, so a table that only the env has, such as one a migration added, goes too.
 envpool_clone_db() {
-	(set -o pipefail; docker exec -e MYSQL_PWD=wordpress "$ENVPOOL_SEED-db" mysqldump -uroot --single-transaction --quick --routines wordpress | docker exec -i -e MYSQL_PWD=wordpress "$1-db" mysql -uroot wordpress)
+	(set -o pipefail; docker exec -e MYSQL_PWD=wordpress "$ENVPOOL_SEED-db" mysqldump -uroot --single-transaction --quick --routines --databases wordpress --add-drop-database | docker exec -i -e MYSQL_PWD=wordpress "$1-db" mysql -uroot)
 }
 
 # envlock calls this for grown envs only, when no live worktree uses them and another env is free.
@@ -113,6 +114,17 @@ envpool_destroy() {
 		left=$(docker ps -aq --filter "$label" && docker volume ls -q --filter "$label") && [ -z "$left" ]
 }
 
+# Replaces env $1's database with a copy of the seed's. The steps are chained with && because envpool_create calls this inside an if, where set -e is off.
+envpool_reseed() {
+	envpool_clone_db "$1" &&
+		envpool_tables_match "$1" &&
+		envpool_wp "$1" search-replace "$ENVPOOL_SEED.altis.dev" "$1.altis.dev" --network --all-tables --precise --report-changed-only --format=count &&
+		envpool_wp "$1" cache flush
+}
+
+# acquire --fresh runs this on a running env, so the agent starts from the seed's data. A stopped seed has no database to copy.
+envpool_fresh() { envpool_seed_up && envpool_reseed "$ENVLOCK_ENV"; }
+
 # Clones the seed env into $ENVLOCK_ENV, so the new env never starts with an empty database.
 # The new env starts from the main checkout, which serves the seed, so it has the seed's code. The first start installs a fresh WordPress.
 # envlock calls this inside an if, where set -e is off, so every step is chained with && and a failure destroys the half-built env.
@@ -120,9 +132,6 @@ envpool_create() {
 	local new=$ENVLOCK_ENV
 	envpool_seed_up &&
 		envpool_start "$new" "$ENVPOOL_MAIN" &&
-		envpool_clone_db "$new" &&
-		envpool_tables_match "$new" &&
-		envpool_wp "$new" search-replace "$ENVPOOL_SEED.altis.dev" "$new.altis.dev" --network --all-tables --precise --report-changed-only --format=count &&
-		envpool_wp "$new" cache flush ||
+		envpool_reseed "$new" ||
 		{ echo "envpool_create: $new failed, destroying it" >&2; envpool_destroy; return 1; }
 }

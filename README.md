@@ -73,6 +73,7 @@ envpool_describe() { ...; }  # print the attributes of $ENVLOCK_ENV as key=value
 envpool_suspend() { ...; }   # stop $ENVLOCK_ENV to save memory; envpool_attach must start it again
 envpool_configure() { ...; } # change $ENVLOCK_ENV to the key=value pairs in "$@"; return non-zero on failure
 envpool_info() { ...; }      # print a hint for the agent after each acquire, for example a login URL for $ENVLOCK_ENV
+envpool_fresh() { ...; }     # replace the database of $ENVLOCK_ENV with the seed's; return non-zero on failure
 ```
 
 Only `ENVS` is required. Leave out `ENVPOOL_MAX` and `envpool_create` to keep the pool a fixed size. With `envpool_exists` and `envpool_create`, envlock creates a name in `ENVS` that does not exist yet when an agent first leases it. With `ENVPOOL_MAX`, `ENVPOOL_PREFIX` and `envpool_create`, `ENVS=()` is valid and the pool grows from zero. Both ways of creating an environment need `acquire --wait`, because building an environment takes minutes. [`examples/vip.envpool`](examples/vip.envpool) is a complete example for VIP dev-env sites, [`examples/altis.envpool`](examples/altis.envpool) for Altis local-server sites and [`examples/ddev.envpool`](examples/ddev.envpool) for DDEV WordPress sites.
@@ -130,6 +131,7 @@ Run `envlock acquire` before anything that needs the environment.
 | `envlock acquire --urgent` | Puts the agent ahead of every waiting agent that did not pass `--urgent`. Urgent agents are served in the order they arrived. Combine it with `--wait` and the other options. |
 | `envlock acquire --need wp=6.9` | Leases an environment whose attributes include `wp=6.9`, and changes one to match if none does. Repeat `--need` for more attributes. Needs `envpool_describe`. |
 | `envlock acquire --want wp=6.9` | Prefers an environment with `wp=6.9`, but leases any free one when none matches. Repeat `--want` for more attributes. Ignored without `envpool_describe`. |
+| `envlock acquire --fresh` | Replaces the environment's database with a copy of the seed's before the agent uses it. Needs `envpool_fresh`. |
 | `envlock env` | Prints the environment this worktree leases, or exits with status 1 if there is none. |
 | `envlock release` | Ends this worktree's lease early. |
 
@@ -140,6 +142,8 @@ A herdr pane holds one lease. When an agent runs `envlock acquire` from another 
 After every `envlock acquire`, including when the worktree already holds a lease, envlock prints the output of `envpool_info` on stderr. `name=$(envlock acquire)` still gets only the name. The VIP example prints an https URL that logs in to the site's admin without a password. Do not pipe `acquire` into a command that stops reading, such as `head -1`. When a hook then writes to the closed pipe, the acquire fails and releases the lock.
 
 Use `--need` when a ticket must run on a given version. envlock leases a free environment that has the attributes, preferring one this worktree used before. If none has them, envlock changes a free environment with `envpool_configure` before it resets and attaches. If `.envpool` has no `envpool_configure`, the agent waits for a matching environment and gives up with exit status 75 when `--wait` runs out. When the worktree already holds a lease that does not match, envlock changes that environment in place. Without `envpool_configure` it exits with status 1 and tells the caller to run `envlock release` first.
+
+Reset keeps the database, so an agent gets the data its previous ticket left behind. Use `--fresh` when a ticket runs migrations or needs clean data. If the copy fails, `acquire` exits non-zero and takes no lease. When the worktree already holds a lease, `--fresh` copies the database in place and keeps the lease, even when the copy fails.
 
 Use `--want` when a version is preferred but any will do. It only changes which free environment envlock tries first. It never changes an environment, never waits for a match and never fails on a mismatch. You can combine the two: `--need` decides which environments qualify, and `--want` picks among them.
 

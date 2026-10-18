@@ -55,6 +55,9 @@ fi
 if [ -n "${TEST_INFO:-}" ]; then
 	envpool_info() { leak; echo "info $ENVLOCK_ENV $ENVLOCK_WORKTREE" >>"$TEST_LOG"; echo "https://$ENVLOCK_ENV.example/?key=1"; [ -z "${TEST_INFO_FAIL:-}" ]; }
 fi
+if [ -n "${TEST_FRESH:-}" ]; then
+	envpool_fresh() { leak; echo "fresh $ENVLOCK_ENV $ENVLOCK_WORKTREE" >>"$TEST_LOG"; echo "seed copied to $ENVLOCK_ENV"; [ -z "${TEST_FRESH_FAIL:-}" ]; }
+fi
 if [ -n "${TEST_DROP:-}" ]; then
 	# Stands in for a shrink that removes g2 from the pool right after acquire locked it.
 	flock() {
@@ -77,7 +80,7 @@ fresh() {
 	idle_all
 	T=$SCR/$1; rm -rf "$T"; mkdir -p "$T/disk" "$T/stub"
 	export XDG_STATE_HOME=$T/state STUB_DIR=$T/stub TEST_LOG=$T/log
-	unset TEST_ENVS TEST_MAX TEST_PREFIX TEST_DISK TEST_CSLEEP TEST_CFAIL TEST_DSLEEP TEST_DESTROY TEST_FAIL TEST_ATTACH_FAIL TEST_HEALTHY_RC TEST_DROP TEST_ATTRS TEST_CONF TEST_CONF_FAIL TEST_DESC_FAIL TEST_LEAK TEST_INFO TEST_INFO_FAIL TEST_SUSPEND TEST_SUSPEND_FAIL
+	unset TEST_ENVS TEST_MAX TEST_PREFIX TEST_DISK TEST_CSLEEP TEST_CFAIL TEST_DSLEEP TEST_DESTROY TEST_FAIL TEST_ATTACH_FAIL TEST_HEALTHY_RC TEST_DROP TEST_ATTRS TEST_CONF TEST_CONF_FAIL TEST_DESC_FAIL TEST_LEAK TEST_INFO TEST_INFO_FAIL TEST_SUSPEND TEST_SUSPEND_FAIL TEST_FRESH TEST_FRESH_FAIL
 	: >"$TEST_LOG"
 	new_repo repo
 	(cd "$T/repo" && "$EL" status >/dev/null)
