@@ -87,7 +87,7 @@ Agents run `envlock acquire` themselves. To change what a ticket gets, tell its 
 | Option | What the ticket gets |
 |---|---|
 | `--wait 3600` | It waits up to an hour for a free environment, instead of giving up straight away. |
-| `--fresh` | A clean copy of the seed environment's database, for a ticket that runs migrations or needs clean data. |
+| `--fresh` | A clean copy of the seed's database, for a ticket that runs migrations or needs clean data. The seed is the environment that serves your main checkout. |
 | `--need wp=6.9` | An environment on WordPress 6.9. envlock changes a free one if none matches. VIP only. |
 | `--want wp=6.9` | WordPress 6.9 if such an environment is free, and any free environment otherwise. VIP only. |
 | `--urgent` | A place ahead of every waiting ticket that did not ask for `--urgent`. |
