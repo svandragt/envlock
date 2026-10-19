@@ -518,7 +518,7 @@ def suspend():
             return 2
         load_envs()
         for e in ALL:
-            if os.path.exists(f"{envdir}/{e}.suspended"):
+            if os.path.exists(f"{envdir}/{e}.suspended") or is_missing(e):
                 continue
             # Holding the lease lock stops anyone leasing e while it is stopped.
             with held(f"{envdir}/{e}.lock", 7) as mine:

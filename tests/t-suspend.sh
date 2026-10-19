@@ -140,4 +140,12 @@ say "OUT=[$OUT] log=[$(tr '\n' ';' <"$TEST_LOG")]"
 check "g3 was destroyed, then b suspended" before 'destroy g3' 'suspend b'
 check "b has a marker, a does not" bash -c '[ -e "$0/b.suspended" ] && [ ! -e "$0/a.suspended" ]' "$ED"
 
+echo "U11 an ENVS name that does not exist yet is not suspended"
+fresh u11; export TEST_ENVS="a b" TEST_SUSPEND=1 TEST_DISK=$T/disk; touch "$T/disk/a"
+elrun repo suspend
+say "rc=$RC out=[$(echo "$OUT" | tr '\n' ';')] markers: $(markers)"
+check "a was suspended" susp a
+check "the missing b got no hook call and no marker" bash -c '[ ! -e "$0/b.suspended" ] && ! grep -q "suspend b" "$1"' "$ED" "$TEST_LOG"
+check "status still shows b as not created" bash -c '! (cd "$0/repo" && "$1" status) | grep -q "^b .*suspended"' "$T" "$EL"
+
 summary
