@@ -57,6 +57,55 @@ Guidance for coding agents working in this repository. `README.md` covers what e
 - A host-free option for Claude Code is a `Stop` hook that runs `envlock release` at the end of each turn, with a holder that waits for the agent's process to exit instead of a herdr state. It works in any terminal, but only for Claude Code sessions.
 - `skills/ticket-fleet` uses herdr to create worktrees and start sessions, so another host needs its own version of that skill.
 
+## Setting up a pool
+
+When a user asks for a pool, write `.envpool` in the root of the project's main checkout and add it to `.git/info/exclude`. Every worktree reads it from there. It is a bash file:
+
+```bash
+ENVS=(my-env-1)              # environments in the pool; envlock creates a name that does not exist yet
+ENVPOOL_PREFIX=my-env-       # name for new environments: my-env-2, my-env-3, ...
+ENVPOOL_MAX=3                # never grow the pool past this
+
+envpool_attach() { ...; }    # point $ENVLOCK_ENV at the code in $ENVLOCK_WORKTREE; always do the full switch
+envpool_healthy() { ...; }   # return 0 when $ENVLOCK_ENV is up and already serves its code
+envpool_reset() { ...; }     # clean up before each lease, for example flush caches
+envpool_create() { ...; }    # build $ENVLOCK_ENV, including its database; return non-zero on failure
+envpool_exists() { ...; }    # return 0 when an environment named $1 exists, so growth picks another name and envlock does not create it
+envpool_destroy() { ...; }   # remove $ENVLOCK_ENV; return non-zero on failure. Without it the pool never shrinks
+envpool_describe() { ...; }  # print the attributes of $ENVLOCK_ENV as key=value pairs, for example: wp=7.1 php=8.4
+envpool_suspend() { ...; }   # stop $ENVLOCK_ENV to save memory; envpool_attach must start it again
+envpool_configure() { ...; } # change $ENVLOCK_ENV to the key=value pairs in "$@"; return non-zero on failure
+envpool_info() { ...; }      # print the URL and the wp-cli command for $ENVLOCK_ENV after each acquire
+envpool_fresh() { ...; }     # replace the database of $ENVLOCK_ENV with the seed's; return non-zero on failure
+```
+
+Only `ENVS` is required. Leave out `ENVPOOL_MAX` and `envpool_create` to keep the pool a fixed size. With `envpool_exists` and `envpool_create`, envlock creates a name in `ENVS` that does not exist yet when an agent first leases it. With `ENVPOOL_MAX`, `ENVPOOL_PREFIX` and `envpool_create`, `ENVS=()` is valid and the pool grows from zero. Both ways of creating an environment need `acquire --wait`, because building one takes minutes.
+
+For VIP dev-env, Altis local-server and DDEV, start from the matching file in `examples/`. For another platform, write the hooks so that they meet the platform contract below.
+
+### VIP dev-env
+
+1. Copy `examples/vip.envpool` to `.envpool`.
+2. Set `ENVPOOL_SEED` to the environment that serves the main checkout. New environments copy its WordPress and PHP versions and its database.
+3. Set `ENVS` to one new name, such as `my-site2`, and `ENVPOOL_PREFIX` to `my-site`.
+4. Set the title, multisite type, mu-plugins and media domain to the values the seed was created with. The seed's `~/.local/share/vip/dev-environment/<seed>/instance_data.json` holds them as `wpTitle`, `multisite`, `muPlugins` and `mediaRedirectDomain`. Never print that file whole: it holds the `autologinKey`.
+5. The example runs the `vip` CLI through the main checkout's devbox. If `vip` is on `PATH`, delete the `vip()` function.
+
+### Altis local-server
+
+1. Copy `examples/altis.envpool` to `.envpool`.
+2. Set `ENVPOOL_SEED` to the local-server name of the main checkout: `extra.altis.modules.local-server.name` in its `composer.json`, or else its directory name. New environments copy its database.
+3. Set `ENVS` to one new name, such as `my-project2`, and `ENVPOOL_PREFIX` to `my-project`. Names are lowercase letters, digits and dashes, because the name becomes the site's host, `https://my-project2.altis.dev`.
+4. The example runs Composer through the main checkout's devbox. If `composer` is on `PATH`, delete the `composer()` function.
+
+### DDEV
+
+1. Copy `examples/ddev.envpool` to `.envpool`.
+2. Set `ENVPOOL_SEED` to the main checkout's DDEV project name, which `ddev list` shows. New environments copy its database.
+3. Set `ENVS` to one new name, such as `my-project2`, and `ENVPOOL_PREFIX` to `my-project`, with the same naming rule as Altis. The site's host is `https://my-project2.ddev.site`.
+4. Make sure the project git-ignores `wp-config.php` and `wp-config-ddev.php`. DDEV writes them into each worktree it starts, and tracked copies would show as changes. Ask the user before changing the project's `.gitignore`.
+5. The example assumes DDEV's default router ports and the `ddev.site` domain.
+
 ## Platform contract
 
 Every platform example in `examples/` gives agents the same behaviour, so a ticket works the same way whichever platform its project uses. `examples/vip.envpool` and `examples/altis.envpool` set the baseline, and a new platform, such as DDEV, must meet it. Each example:

@@ -11,9 +11,17 @@ envlock cuts context switching when you juggle several tickets on one machine. E
 </td>
 </tr></table>
 
-You can leave a ticket and come back to it without re-explaining anything or stashing work. An agent leases an environment only when it is about to use it, waits its turn if none is free, and gets the same environment back next time if it can. The lease ends when the agent finishes its turn. Think php-fpm, but the workers are dev environments.
+You can leave a ticket and come back to it without re-explaining anything or stashing work. Think php-fpm, but the workers are dev environments.
 
-## You
+## How it works
+
+- Each ticket has its own git worktree and its own agent session.
+- When an agent is about to use a site, it runs `envlock acquire`. envlock picks a free environment, points it at the ticket's code and prints its name.
+- The lease ends when the agent finishes its turn. On its next turn the agent usually gets the same environment back, without switching code again.
+- When every environment is busy, the agent waits its turn. envlock builds another environment in the background, up to a limit you set, and later removes or stops the ones nobody uses.
+- An environment keeps its database between leases, so a ticket finds the data it left behind.
+
+## Get started
 
 ### Install
 
@@ -26,15 +34,27 @@ ln -s "$PWD/skills/ticket-fleet" ~/.claude/skills/ticket-fleet
 
 envlock needs bash, git, `flock` (util-linux) and [herdr](https://herdr.dev). A lease belongs to the herdr agent that asked for it, so `envlock acquire` works only in a herdr pane.
 
-### Ask your agent to set up a pool
+### Set up a pool
 
-You never write the pool description yourself. Open your agent in the main checkout of your project and ask it:
+Open your agent in the main checkout of your project and ask it:
 
 ```text
 Set up an envlock pool for this repo
 ```
 
-The agent adds a `.envpool` file to the root of the main checkout. [Set up a pool](#set-up-a-pool) describes what it does.
+The agent writes a `.envpool` file in the main checkout and keeps it out of git. envlock creates the first environment when an agent first needs one. That takes from half a minute to a few minutes, depending on the platform.
+
+envlock comes with ready-made pools for three local platforms:
+
+| Platform | Example | Notes |
+|---|---|---|
+| VIP dev-env | [`examples/vip.envpool`](examples/vip.envpool) | Agents can ask for a WordPress or PHP version. |
+| Altis local-server | [`examples/altis.envpool`](examples/altis.envpool) | Versions follow each ticket's code. |
+| DDEV | [`examples/ddev.envpool`](examples/ddev.envpool) | Versions follow each ticket's code. Only worktrees can lease, not the main checkout. |
+
+For another platform, the agent writes the pool from scratch, following the rules in [AGENTS.md](AGENTS.md).
+
+Each platform runs its own proxy on ports 80 and 443, so you can use the pools of only one platform at a time. Stop the other platforms' environments first.
 
 ### Start a session per ticket
 
@@ -48,130 +68,7 @@ The skill creates a worktree and a Claude Code session per ticket, and tells eac
 
 ### Check the pool
 
-Run `envlock status` from any worktree of the project. It shows which environments are in use, by which ticket and which herdr pane, and who is waiting. An environment that envlock has yet to create shows as `not created`. When `.envpool` has `envpool_describe`, each environment's line ends with its attributes. The last line is the path of the events log. Read that log when an acquire fails or a lease ends and you do not know why. [See the pool](#see-the-pool) shows an example.
-
-## Your agent
-
-Your agent writes `.envpool`, leases environments and looks after the pool. It runs the commands in this part from any worktree of the project.
-
-### Set up a pool
-
-Add a `.envpool` file to the root of the project's main checkout. Every worktree of the project reads it, so it can stay out of git. It is a bash file:
-
-```bash
-ENVS=(my-env-1)              # environments in the pool; envlock creates a name that does not exist yet
-ENVPOOL_PREFIX=my-env-       # name for new environments: my-env-2, my-env-3, ...
-ENVPOOL_MAX=3                # never grow the pool past this
-
-envpool_attach() { ...; }    # point $ENVLOCK_ENV at the code in $ENVLOCK_WORKTREE; always do the full switch
-envpool_healthy() { ...; }   # return 0 when $ENVLOCK_ENV is up and already serves its code
-envpool_reset() { ...; }     # clean up before each lease, for example flush caches
-envpool_create() { ...; }    # build $ENVLOCK_ENV, including its database; return non-zero on failure
-envpool_exists() { ...; }    # return 0 when an environment named $1 exists, so growth picks another name and envlock does not create it
-envpool_destroy() { ...; }   # remove $ENVLOCK_ENV; return non-zero on failure. Without it the pool never shrinks
-envpool_describe() { ...; }  # print the attributes of $ENVLOCK_ENV as key=value pairs, for example: wp=7.1 php=8.4
-envpool_suspend() { ...; }   # stop $ENVLOCK_ENV to save memory; envpool_attach must start it again
-envpool_configure() { ...; } # change $ENVLOCK_ENV to the key=value pairs in "$@"; return non-zero on failure
-envpool_info() { ...; }      # print a hint for the agent after each acquire, for example a login URL for $ENVLOCK_ENV
-envpool_fresh() { ...; }     # replace the database of $ENVLOCK_ENV with the seed's; return non-zero on failure
-```
-
-Only `ENVS` is required. Leave out `ENVPOOL_MAX` and `envpool_create` to keep the pool a fixed size. With `envpool_exists` and `envpool_create`, envlock creates a name in `ENVS` that does not exist yet when an agent first leases it. With `ENVPOOL_MAX`, `ENVPOOL_PREFIX` and `envpool_create`, `ENVS=()` is valid and the pool grows from zero. Both ways of creating an environment need `acquire --wait`, because building an environment takes minutes. [`examples/vip.envpool`](examples/vip.envpool) is a complete example for VIP dev-env sites, [`examples/altis.envpool`](examples/altis.envpool) for Altis local-server sites and [`examples/ddev.envpool`](examples/ddev.envpool) for DDEV WordPress sites.
-
-VIP dev-env, Altis local-server and DDEV each run a proxy on ports 80 and 443, so you can run the pools of only one of them at a time. Stop the other platforms' environments first.
-
-envlock remembers which worktree it last switched each environment to. When the same worktree comes back, envlock skips `envpool_attach`, as long as `envpool_healthy` returns 0 or does not exist. If `envpool_attach` fails, envlock forgets the switch and runs it again next time.
-
-#### Set up a pool for a VIP dev-env site
-
-1. Copy [`examples/vip.envpool`](examples/vip.envpool) to `.envpool` in the main checkout, and add `.envpool` to `.git/info/exclude`.
-2. Set `ENVPOOL_SEED` to the environment that serves the main checkout. New environments copy its WordPress and PHP versions and its database.
-3. Set `ENVS` to one new name, such as `my-site2`, and `ENVPOOL_PREFIX` to `my-site`. envlock creates the environment on the first acquire.
-4. Set the title, multisite type, mu-plugins and media domain to the values the seed was created with. The seed's `~/.local/share/vip/dev-environment/<seed>/instance_data.json` holds them as `wpTitle`, `multisite`, `muPlugins` and `mediaRedirectDomain`.
-5. Run `envlock acquire --wait 3600` from a worktree. envlock creates `my-site2`, which takes a few minutes, and then leases it.
-
-The example runs the `vip` CLI through the main checkout's devbox. If `vip` is on your `PATH`, delete the `vip()` function.
-
-#### Set up a pool for an Altis local-server site
-
-1. Copy [`examples/altis.envpool`](examples/altis.envpool) to `.envpool` in the main checkout, and add `.envpool` to `.git/info/exclude`.
-2. Set `ENVPOOL_SEED` to the name of the environment that serves the main checkout. That is the name of its directory, or `extra.altis.modules.local-server.name` in its `composer.json`. New environments copy its database.
-3. Set `ENVS` to one new name, such as `my-project2`, and `ENVPOOL_PREFIX` to `my-project`. Use lowercase letters, digits and dashes: the name becomes the site's address, `https://my-project2.altis.dev`.
-4. Run `envlock acquire --wait 3600` from a worktree. envlock creates `my-project2`, which takes about a minute, and then leases it.
-
-Each worktree needs its own `composer install`. The attach step runs it when the worktree has no `vendor` directory.
-
-The example runs Composer through the main checkout's devbox. If `composer` is on your `PATH`, delete the `composer()` function.
-
-The WordPress and PHP versions come from each worktree's code, so the example has no `envpool_describe` and `--need` and `--want` do not apply. Agents run wp-cli through the `docker exec` command that `envpool_info` prints after each acquire.
-
-#### Set up a pool for a DDEV site
-
-1. Copy [`examples/ddev.envpool`](examples/ddev.envpool) to `.envpool` in the main checkout, and add `.envpool` to `.git/info/exclude`.
-2. Set `ENVPOOL_SEED` to the DDEV project name of the main checkout, which `ddev list` shows. New environments copy its database.
-3. Set `ENVS` to one new name, such as `my-project2`, and `ENVPOOL_PREFIX` to `my-project`. Use lowercase letters, digits and dashes: the name becomes the site's address, `https://my-project2.ddev.site`.
-4. Git-ignore `wp-config.php` and `wp-config-ddev.php` in the project. DDEV writes its own copies into each worktree it starts, and tracked copies would show as changes.
-5. Run `envlock acquire --wait 3600` from a worktree. envlock creates `my-project2`, which takes about half a minute, and then leases it.
-
-The main checkout cannot lease an environment. DDEV allows one project name per directory, and the seed uses the main checkout's. Run `envlock acquire` from a worktree.
-
-A worktree that has a `composer.json` needs its own `composer install`. The attach step runs it when the worktree has no `vendor` directory.
-
-Each environment is a DDEV project named after the environment. Attaching moves the project to the worktree and keeps its database, so `ddev` commands work from the leased worktree. Agents run wp-cli with the `ddev wp --allow-root <command>` that `envpool_info` prints after each acquire. The example assumes DDEV's default router ports and `ddev.site` domain.
-
-The worktree's `.ddev/config.yaml` sets the PHP and database versions, so the example has no `envpool_describe` and `--need` and `--want` do not apply.
-
-### Lease an environment
-
-Run `envlock acquire` before anything that needs the environment.
-
-| Command | What it does |
-|---|---|
-| `envlock acquire --wait 3600` | Leases an environment for the calling agent and prints its name. The lease ends when the agent finishes its turn or its pane closes, so run it again next turn. An agent that waits at a permission prompt keeps its lease. Running it again while the worktree holds a lease prints the same environment. |
-| `envlock acquire --urgent` | Puts the agent ahead of every waiting agent that did not pass `--urgent`. Urgent agents are served in the order they arrived. Combine it with `--wait` and the other options. |
-| `envlock acquire --need wp=6.9` | Leases an environment whose attributes include `wp=6.9`, and changes one to match if none does. Repeat `--need` for more attributes. Needs `envpool_describe`. |
-| `envlock acquire --want wp=6.9` | Prefers an environment with `wp=6.9`, but leases any free one when none matches. Repeat `--want` for more attributes. Ignored without `envpool_describe`. |
-| `envlock acquire --fresh` | Replaces the environment's database with a copy of the seed's before the agent uses it. Needs `envpool_fresh`. |
-| `envlock env` | Prints the environment this worktree leases, or exits with status 1 if there is none. |
-| `envlock release` | Ends this worktree's lease early. |
-
-Without `--wait`, envlock gives up straight away when every environment is busy or has yet to be created.
-
-A herdr pane holds one lease. When an agent runs `envlock acquire` from another worktree, envlock first ends the lease that the pane holds for the old worktree.
-
-After every `envlock acquire`, including when the worktree already holds a lease, envlock prints the output of `envpool_info` on stderr. `name=$(envlock acquire)` still gets only the name. The VIP example prints an https URL that logs in to the site's admin without a password. Do not pipe `acquire` into a command that stops reading, such as `head -1`. When a hook then writes to the closed pipe, the acquire fails and releases the lock.
-
-Use `--need` when a ticket must run on a given version. envlock leases a free environment that has the attributes, preferring one this worktree used before. If none has them, envlock changes a free environment with `envpool_configure` before it resets and attaches. If `.envpool` has no `envpool_configure`, the agent waits for a matching environment and gives up with exit status 75 when `--wait` runs out. When the worktree already holds a lease that does not match, envlock changes that environment in place. Without `envpool_configure` it exits with status 1 and tells the caller to run `envlock release` first.
-
-Reset keeps the database, so an agent gets the data its previous ticket left behind. Use `--fresh` when a ticket runs migrations or needs clean data. If the copy fails, `acquire` exits non-zero and takes no lease. When the worktree already holds a lease, `--fresh` copies the database in place and keeps the lease, even when the copy fails.
-
-Use `--want` when a version is preferred but any will do. It only changes which free environment envlock tries first. It never changes an environment, never waits for a match and never fails on a mismatch. You can combine the two: `--need` decides which environments qualify, and `--want` picks among them.
-
-### Look after the pool
-
-envlock grows, shrinks and suspends the pool by itself. These commands do the same work on request:
-
-| Command | What it does |
-|---|---|
-| `envlock grow` | Adds an environment to the pool now, even past `ENVPOOL_MAX`. |
-| `envlock shrink` | Removes the environments envlock added that no unfinished ticket uses, now. At least one environment stays free. |
-| `envlock suspend` | Stops the free environments that no unfinished ticket uses, now. Needs `envpool_suspend`. |
-
-When a lease takes the last free environment, envlock builds another one in the background, up to `ENVPOOL_MAX`, so the next ticket does not wait for it. After each lease, envlock also removes an environment it added earlier when no existing worktree has it as its most recent lease and another environment is free. Environments in `ENVS` are never removed.
-
-When `.envpool` has `envpool_suspend`, envlock stops free environments that no existing worktree has as its most recent lease, to save memory, and `envlock status` shows them as `free, suspended`. The next lease starts the environment again through `envpool_attach`, so `envpool_attach` must start a stopped environment and `envpool_reset` must cope with one.
-
-envlock writes one line for each lease, release and failure to the events log, for example `leased`, `released`, `attach-failed` and `timeout`. The last line of `envlock status` is the path of the log. Read it when an acquire fails or a lease ends and you do not know why. It records which step failed and with what exit status, which the terminal of the agent that ran `envlock acquire` can lose. Once the log passes 1 MiB, envlock keeps its last 5000 lines.
-
-If two projects list the same environment, they share one lock.
-
-## Examples
-
-These examples use a VIP dev-env project whose pool has two environments, `site2` and `site3`. `site` is the seed, which serves the main checkout. Each example says whether you or your agent runs the commands.
-
-### See the pool
-
-You run this:
+Run `envlock status` from any worktree of the project:
 
 ```console
 $ envlock status
@@ -181,48 +78,52 @@ site3  free  wp=7.1 php=8.4
 events log: ~/.local/state/envlock/3f9a1c07d2b4/events.log
 ```
 
-### Run a check against the site
+It shows which environments are in use, by which ticket and herdr pane, who is waiting, and which environments are `not created` yet or `suspended`. On VIP, each line ends with the environment's versions.
 
-Your agent leases an environment, then uses its name:
+## Ask for what a ticket needs
 
-```bash
-name=$(envlock acquire --wait 3600)
-curl -s -o /dev/null -w '%{http_code}\n' "https://$name.vipdev.lndo.site/"
-```
+Agents run `envlock acquire` themselves. To change what a ticket gets, tell its agent to add one of these options:
 
-The lease ends when the agent finishes its turn. On its next turn the agent runs `envlock acquire` again and usually gets the same environment back, without switching code.
+| Option | What the ticket gets |
+|---|---|
+| `--wait 3600` | It waits up to an hour for a free environment, instead of giving up straight away. |
+| `--fresh` | A clean copy of the seed environment's database, for a ticket that runs migrations or needs clean data. |
+| `--need wp=6.9` | An environment on WordPress 6.9. envlock changes a free one if none matches. VIP only. |
+| `--want wp=6.9` | WordPress 6.9 if such an environment is free, and any free environment otherwise. VIP only. |
+| `--urgent` | A place ahead of every waiting ticket that did not ask for `--urgent`. |
 
-### Test on the versions production runs
+`--need` and `--want` take any attribute the pool reports, such as `php=8.2`, and repeat for more than one.
 
-Your agent looks up the hosted environment's versions, then asks for them:
+An agent that waits at a permission prompt keeps its lease. To free an environment early, run `envlock release` from the ticket's worktree. `envlock env` prints the environment that the worktree leases.
 
-```console
-$ vip @my-app.preprod config software get   # output shortened
-WordPress  6.9
-PHP        8.2
+## Look after the pool
 
-$ envlock acquire --need wp=6.9 --need php=8.2
-site2
-```
+envlock grows, shrinks and stops the pool by itself:
 
-If no environment has those versions, envlock changes a free one first. That takes about 30 seconds on VIP dev-env.
+- When a ticket takes the last free environment, envlock builds another one in the background, up to the pool's limit, so the next ticket does not wait.
+- envlock removes an environment it built when no remaining worktree uses it and another environment is free. The environments you listed are never removed.
+- envlock stops free environments that no worktree uses, to save memory, and starts them again on the next lease.
 
-### Prefer a version without waiting for it
+These commands do the same work now:
 
-A styling fix looks the same on any WordPress version, but the ticket is easier to compare with production on 6.9. Your agent runs:
+| Command | What it does |
+|---|---|
+| `envlock grow` | Adds an environment, even past the pool's limit. |
+| `envlock shrink` | Removes the environments envlock built that no remaining worktree uses. One environment stays free. |
+| `envlock suspend` | Stops the free environments that no remaining worktree uses. |
 
-```bash
-envlock acquire --want wp=6.9
-```
+## Example: three tickets, two environments
 
-envlock picks a 6.9 environment if one is free and takes any free environment otherwise.
+The pool has `site2` and `site3`, and may grow to three. You start three sessions with `/ticket-fleet`:
 
-### Three tickets, two environments
+1. ABC-101 needs WordPress 6.9. Its agent runs `envlock acquire --need wp=6.9` and gets `site2`.
+2. ABC-102's agent runs `envlock acquire` and gets `site3`. No environment is free now, so envlock starts building `site4` in the background.
+3. ABC-103's agent runs `envlock acquire --wait 3600` and waits. It gets the first environment that frees up, or `site4` when it is ready.
+4. ABC-101's agent finishes its turn, and its lease ends. Its next `acquire` gets `site2` back.
+5. After you delete the worktrees of the tickets that used `site4`, envlock removes `site4`, as long as another environment is free.
 
-You start three sessions with `/ticket-fleet`. Each agent runs its own commands:
+## Troubleshooting
 
-1. ABC-101 runs `envlock acquire --need wp=6.9` and gets `site2`.
-2. ABC-102 runs `envlock acquire` and gets `site3`. No environment is free now, so envlock starts building `site4` in the background.
-3. ABC-103 runs `envlock acquire --wait 3600` and waits. It gets the first environment that frees up, or `site4` when it is ready.
-4. ABC-101 finishes its turn and its lease ends. Its next `acquire` prefers `site2` again.
-5. Once every ticket whose most recent environment is `site4` has finished and had its worktree deleted, envlock removes `site4`, as long as another environment is free.
+- **An acquire fails, or a lease ends and you do not know why.** Read the events log, whose path is the last line of `envlock status`. It records each lease, release and failure, with the step that failed and its exit status.
+- **An agent gives up with "all environments busy".** Tell it to use `--wait`, or raise the pool's limit in `.envpool`.
+- **A site does not load after you switch platforms.** Another platform's proxy still holds ports 80 and 443. Stop that platform's environments.
