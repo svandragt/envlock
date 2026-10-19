@@ -128,7 +128,7 @@ envpool_reseed() {
 }
 
 # acquire --fresh runs this on a running env, so the agent starts from the seed's data. A stopped seed has no database to copy.
-envpool_seed_up() { ddev start "$ENVPOOL_SEED"; }
+envpool_seed_up() { [ -n "$(envpool_approot "$ENVPOOL_SEED" running)" ] || ddev start "$ENVPOOL_SEED"; }
 
 envpool_fresh() { envpool_seed_up && envpool_reseed "$ENVLOCK_ENV"; }
 
