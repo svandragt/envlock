@@ -5,14 +5,8 @@ here=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source-path=SCRIPTDIR source=lib.sh
 source "$here/lib.sh"
 
-# The queue polls every 5 seconds; this sleep shortens only that one, so the waiters below take turns quickly.
-real_sleep=$(command -v sleep)
-cat >"$SCR/bin/sleep" <<EOF
-#!/bin/sh
-[ "\$1" = 5 ] && set -- 0.3
-exec $real_sleep "\$@"
-EOF
-chmod +x "$SCR/bin/sleep"
+# The queue polls every 5 seconds by default; a shorter poll makes the waiters below take turns quickly.
+export ENVLOCK_POLL=0.3
 
 ev() { cat "$LD/events.log" 2>/dev/null; }
 evhas() { ev | grep -qE -- "$1"; }
@@ -193,5 +187,15 @@ fresh g7; rm "$T/repo/.envpool"
 elrun repo status
 say "rc=$RC out=[$OUT]"
 check "exit 1 with the worktree named and the hint" bash -c '[ "$0" = 1 ] && grep -q "no .envpool in $1/repo or the main checkout; ask your agent to set up a pool (see README)" <<<"$2"' "$RC" "$T" "$OUT"
+
+echo "G8 ENVLOCK_POLL sets how often a queued waiter looks for a free env"
+fresh g8; export TEST_ENVS=a
+acq "$T/repo"; PH=$PANE
+wt w8
+bg w8 "$T/w8" pw8 --wait 30; sleep 0.5
+s=$(date +%s%N); idle "$PH"; waited w8; ms=$((($(date +%s%N) - s) / 1000000))
+say "the waiter took the freed env after ${ms}ms with ENVLOCK_POLL=$ENVLOCK_POLL; out=$(cat "$T/w8.out")"
+check "the waiter leased the freed env within 3s" bash -c '[ "$0" = a ] && [ "$1" -lt 3000 ]' "$(cat "$T/w8.out")" "$ms"
+idle pw8
 
 summary

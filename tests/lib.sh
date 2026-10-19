@@ -9,7 +9,10 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 SCR=$(mktemp -d)
 mkdir "$SCR/bin"
 ln -s "$here/bin/herdr" "$SCR/bin/herdr"
-ln -s "$here/../bin/envlock" "$SCR/bin/envlock"
+# ENVLOCK_BIN picks the file under test; a relative path is relative to the repo root.
+el_bin=${ENVLOCK_BIN:-bin/envlock}
+[[ $el_bin == /* ]] || el_bin=$here/../$el_bin
+ln -s "$el_bin" "$SCR/bin/envlock"
 EL=$SCR/bin/envlock
 export PATH=$SCR/bin:$PATH XDG_STATE_HOME=$SCR/state
 pass=0 fail=0 PN=0 PANE='' OUT='' ERR='' RC=0 T='' LD='' ED=''
@@ -63,11 +66,8 @@ if [ -n "${TEST_WATCH:-}" ]; then
 	envpool_watch() { echo "watch $ENVLOCK_ENV $ENVLOCK_SLOT" >>"$TEST_LOG"; sleep "$TEST_WATCH"; }
 fi
 if [ -n "${TEST_DROP:-}" ]; then
-	# Stands in for a shrink that removes g2 from the pool right after acquire locked it.
-	flock() {
-		command flock "$@" || return
-		if [ "$*" = "-n 9" ] && [[ $(readlink "/proc/$$/fd/9") == */g2.lock ]]; then sed -i '/^g2$/d' "$TEST_DROP"; fi
-	}
+	# Stands in for a shrink that removes g2 from the pool before acquire locks it.
+	envpool_before_lock() { [ "$ENVLOCK_ENV" != g2 ] || sed -i '/^g2$/d' "$TEST_DROP"; }
 fi
 EOP
 }
@@ -126,8 +126,12 @@ wait_pid() { pgrep -f "^bash $SCR/bin/herdr agent wait ${1:+$1 }" | head -1; }
 waits_for() { [ -n "$(wait_pid "$1")" ]; }
 nowait() { ! waits_for "$1"; }
 
+# The detached jobs run as a bash -c loop or as an interpreter running envlock with a hidden subcommand, so the patterns match either command line.
+bg_job="^(bash -c for s; do .* $SCR/bin/envlock |([^ ]*/)?python[0-9.]* $SCR/bin/envlock __background )"
+hold_job="^(bash -c declare -- lockdir=\"$SCR/|([^ ]*/)?python[0-9.]* $SCR/bin/envlock __hold )"
+
 # Waits for the detached shrink/suspend job that acquire starts.
-settle() { sleep 0.3; while pgrep -f "^bash -c for s; do .* $SCR/bin/envlock " >/dev/null; do sleep 0.1; done; }
+settle() { sleep 0.3; while pgrep -f "$bg_job" >/dev/null; do sleep 0.1; done; }
 
 # Hooks started with TEST_LEAK=file record the pid of each background sleep in that file.
 leaks_alive() { local p; [ -s "$TEST_LEAK" ] || return 1; while read -r p; do kill -0 "$p" 2>/dev/null || return 1; done <"$TEST_LEAK"; }
@@ -139,7 +143,7 @@ summary() { echo; echo "passed=$pass failed=$fail"; [ "$fail" = 0 ]; }
 # Lets the holders end before the scratch dir goes, so none of them writes a log into a half-removed tree or misses its watcher's pid file.
 finish() {
 	kill_leaks; idle_all
-	for _ in $(seq 50); do [ -z "$(wait_pid)" ] && ! pgrep -f "^bash -c declare -- lockdir=\"$SCR/" >/dev/null && break; sleep 0.1; done
+	for _ in $(seq 50); do [ -z "$(wait_pid)" ] && ! pgrep -f "$hold_job" >/dev/null && break; sleep 0.1; done
 	rm -rf "$SCR"
 }
 trap finish EXIT

@@ -446,6 +446,8 @@ acquire() {
 			# An env whose holder file still names this worktree already serves its code, so it ranks first.
 			mapfile -t order < <(try_order)
 			for e in "${order[@]}"; do
+				# Test seam: lets a test change the pool just before the lock is taken, as a shrink that finishes first would. Real pools do not need it.
+				if declare -F envpool_before_lock >/dev/null; then ENVLOCK_ENV=$e hook envpool_before_lock >&2 || true; fi
 				exec 9>"$envdir/$e.lock"
 				if flock -n 9; then
 					# A shrink drops a name from the pool while it holds the lock, so a name that is gone is not leasable.
@@ -472,7 +474,8 @@ acquire() {
 			log timeout "$label" pane "$session" "${asks[@]}"
 			exit 75
 		}
-		sleep 5
+		# ENVLOCK_POLL is a test seam: it lets the tests poll faster than every 5 seconds.
+		sleep "${ENVLOCK_POLL:-5}"
 	done
 	rm -f "$qentry"
 	ENVLOCK_SLOT=$(env_slot "$e")
