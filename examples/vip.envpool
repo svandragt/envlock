@@ -18,13 +18,7 @@ ENVPOOL_MAIN=$(dirname "$(realpath "${BASH_SOURCE[0]}")")
 vip() { (cd "$ENVPOOL_MAIN" && devbox run -- vip "$@"); }
 
 # -L: a site that redirects its home page is up once the redirect target answers.
-# The proxy moves off 443 when another proxy holds it. --connect-to keeps the port out of the URL, because WordPress answers "Site not found" for a host with a port.
-envpool_up() {
-	local port
-	port=$(docker port vip-dev-env-proxy-proxy-1 443/tcp 2>/dev/null | head -1)
-	port=${port##*:}
-	[ "$(curl -skL -o /dev/null -w '%{http_code}' --max-time 20 --connect-to "$1.vipdev.lndo.site:443:127.0.0.1:${port:-443}" "https://$1.vipdev.lndo.site/")" = 200 ]
-}
+envpool_up() { [ "$(curl -skL -o /dev/null -w '%{http_code}' --max-time 20 "https://$1.vipdev.lndo.site/")" = 200 ]; }
 
 # The proxy answers 404 for the env's hostname until the site is up, so attach waits for 200.
 envpool_wait_up() {
@@ -68,7 +62,7 @@ envpool_reset() {
 
 envpool_exists() { [ -e "$HOME/.local/share/vip/dev-environment/$1" ]; }
 
-# Prints an https URL that logs in to wp-admin on its own, then the wp-cli command. A browser reaches it only while the VIP proxy holds 443 (see envpool_up). It must be https: over http a headless browser gets an http-only cookie, and its next https admin request bounces to the login page.
+# Prints an https URL that logs in to wp-admin on its own, then the wp-cli command. It must be https: over http a headless browser gets an http-only cookie, and its next https admin request bounces to the login page.
 envpool_info() {
 	jq -er --arg env "$ENVLOCK_ENV" '(.autologinKey // empty) as $k | "https://\($env).vipdev.lndo.site/wp-admin/?vip-dev-autologin=\($k)"' "$HOME/.local/share/vip/dev-environment/$ENVLOCK_ENV/instance_data.json"
 	echo "wp-cli: vip dev-env exec --slug=$ENVLOCK_ENV --quiet -- wp <command>"
