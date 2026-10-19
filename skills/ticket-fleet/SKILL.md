@@ -117,6 +117,10 @@ Run this once per fleet, before creating any worktree:
      `envlock status` shows: `--need wp=6.9` when the ticket must be tested on that version,
      `--want wp=6.9` when that version is preferred but any will do, and neither when the
      version does not matter.
+   - Add `--watch` to `envlock acquire` for front-end work that needs the project's build
+     watcher or hot reloading. The watcher runs while you hold the environment.
+   - Add `--fresh` to `envlock acquire` when the ticket runs migrations or needs clean data.
+     It replaces the environment's database with the seed's.
    - The lease ends by itself when you finish your turn, so run
      `envlock acquire --wait 3600` again in the next turn that needs the environment.
    - `envlock release` ends the lease early.

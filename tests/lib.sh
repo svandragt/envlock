@@ -58,6 +58,10 @@ fi
 if [ -n "${TEST_FRESH:-}" ]; then
 	envpool_fresh() { leak; echo "fresh $ENVLOCK_ENV $ENVLOCK_WORKTREE" >>"$TEST_LOG"; echo "seed copied to $ENVLOCK_ENV"; [ -z "${TEST_FRESH_FAIL:-}" ]; }
 fi
+# With TEST_WATCH=seconds the watcher logs its env and slot, then sleeps that long.
+if [ -n "${TEST_WATCH:-}" ]; then
+	envpool_watch() { echo "watch $ENVLOCK_ENV $ENVLOCK_SLOT" >>"$TEST_LOG"; sleep "$TEST_WATCH"; }
+fi
 if [ -n "${TEST_DROP:-}" ]; then
 	# Stands in for a shrink that removes g2 from the pool right after acquire locked it.
 	flock() {
@@ -80,7 +84,7 @@ fresh() {
 	idle_all
 	T=$SCR/$1; rm -rf "$T"; mkdir -p "$T/disk" "$T/stub"
 	export XDG_STATE_HOME=$T/state STUB_DIR=$T/stub TEST_LOG=$T/log
-	unset TEST_ENVS TEST_MAX TEST_PREFIX TEST_DISK TEST_CSLEEP TEST_CFAIL TEST_DSLEEP TEST_DESTROY TEST_FAIL TEST_ATTACH_FAIL TEST_HEALTHY_RC TEST_DROP TEST_ATTRS TEST_CONF TEST_CONF_FAIL TEST_DESC_FAIL TEST_LEAK TEST_INFO TEST_INFO_FAIL TEST_SUSPEND TEST_SUSPEND_FAIL TEST_FRESH TEST_FRESH_FAIL
+	unset TEST_ENVS TEST_MAX TEST_PREFIX TEST_DISK TEST_CSLEEP TEST_CFAIL TEST_DSLEEP TEST_DESTROY TEST_FAIL TEST_ATTACH_FAIL TEST_HEALTHY_RC TEST_DROP TEST_ATTRS TEST_CONF TEST_CONF_FAIL TEST_DESC_FAIL TEST_LEAK TEST_INFO TEST_INFO_FAIL TEST_SUSPEND TEST_SUSPEND_FAIL TEST_FRESH TEST_FRESH_FAIL TEST_WATCH
 	: >"$TEST_LOG"
 	new_repo repo
 	(cd "$T/repo" && "$EL" status >/dev/null)
@@ -132,10 +136,10 @@ kill_leaks() { local f; for f in "$SCR"/*/leak; do [ -s "$f" ] || continue; xarg
 
 summary() { echo; echo "passed=$pass failed=$fail"; [ "$fail" = 0 ]; }
 
-# Lets the holders end before the scratch dir goes, so none of them writes a log into a half-removed tree.
+# Lets the holders end before the scratch dir goes, so none of them writes a log into a half-removed tree or misses its watcher's pid file.
 finish() {
 	kill_leaks; idle_all
-	for _ in $(seq 50); do [ -z "$(wait_pid)" ] && break; sleep 0.1; done
+	for _ in $(seq 50); do [ -z "$(wait_pid)" ] && ! pgrep -f "^bash -c declare -- lockdir=\"$SCR/" >/dev/null && break; sleep 0.1; done
 	rm -rf "$SCR"
 }
 trap finish EXIT

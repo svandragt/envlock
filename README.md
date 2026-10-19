@@ -20,6 +20,7 @@ You can leave a ticket and come back to it without re-explaining anything or sta
 - The lease ends when the agent finishes its turn. On its next turn the agent usually gets the same environment back, without switching code again.
 - When every environment is busy, the agent waits its turn. envlock builds another environment in the background, up to a limit you set, and later removes or stops the ones nobody uses.
 - An environment keeps its database between leases, so a ticket finds the data it left behind.
+- If the project has a build watcher such as `npm run start`, an agent can ask for it with `--watch`. It runs while the ticket holds the environment and stops when the lease ends.
 
 ## Get started
 
@@ -88,6 +89,7 @@ Agents run `envlock acquire` themselves. To change what a ticket gets, tell its 
 |---|---|
 | `--wait 3600` | It waits up to an hour for a free environment, instead of giving up straight away. |
 | `--fresh` | A clean copy of the seed's database, for a ticket that runs migrations or needs clean data. The seed is the environment that serves your main checkout. |
+| `--watch` | The project's build watcher, such as `npm run start`, running while the ticket holds the environment, for hot reloading. |
 | `--need wp=6.9` | An environment on WordPress 6.9. envlock changes a free one if none matches. VIP only. |
 | `--want wp=6.9` | WordPress 6.9 if such an environment is free, and any free environment otherwise. VIP only. |
 | `--urgent` | A place ahead of every waiting ticket that did not ask for `--urgent`. |
@@ -126,4 +128,5 @@ The pool has `site2` and `site3`, and may grow to three. You start three session
 
 - **An acquire fails, or a lease ends and you do not know why.** Read the events log, whose path is the last line of `envlock status`. It records each lease, release and failure, with the step that failed and its exit status.
 - **An agent gives up with "all environments busy".** Tell it to use `--wait`, or raise the pool's limit in `.envpool`.
+- **The build watcher does not run, or stops early.** Read `watch/<environment>.log` in the directory that holds the events log. The watcher's output goes there.
 - **A site does not load after you switch platforms.** Another platform's proxy still holds ports 80 and 443. Stop that platform's environments.

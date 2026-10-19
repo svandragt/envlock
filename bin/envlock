@@ -19,11 +19,13 @@
 # envpool_suspend (sees ENVLOCK_ENV, same contract as envpool_destroy) stops a spare env
 # to save memory; the next acquire of it runs envpool_attach, which must start it.
 # envpool_fresh (sees ENVLOCK_ENV and ENVLOCK_WORKTREE) replaces the env's database with the seed's; acquire --fresh runs it after envpool_attach and on reuse.
+# envpool_watch (sees ENVLOCK_ENV, ENVLOCK_WORKTREE and ENVLOCK_SLOT) runs a build watcher in the foreground; acquire --watch starts it, on a new lease or a reuse, and the holder stops it when the lease ends.
+# Every hook runs for a leased env with ENVLOCK_SLOT, a small number that stays the same for that env until it is destroyed.
 # Every hook runs with envlock's lock fds closed, so nothing a hook starts holds a lock.
 set -euo pipefail
 
 usage() {
-	echo "usage: envlock acquire [--wait SECONDS] [--urgent] [--fresh] [--need KEY=VALUE]... [--want KEY=VALUE]..." >&2
+	echo "usage: envlock acquire [--wait SECONDS] [--urgent] [--fresh] [--watch] [--need KEY=VALUE]... [--want KEY=VALUE]..." >&2
 	echo "       envlock env" >&2
 	echo "       envlock release" >&2
 	echo "       envlock status" >&2
@@ -79,13 +81,63 @@ trim_log() {
 	tail -n 5000 "$lockdir/events.log" >"$lockdir/events.log.$$" && mv "$lockdir/events.log.$$" "$lockdir/events.log" || true
 }
 
-# The holder: runs the wait as a child with fd 9 closed, so only the holder keeps the lease. A TERM from `envlock release` kills the whole process group, wait included, and logs nothing, because release logs it.
+# Prints env $1's slot. An env without one gets the lowest positive number that no env holds, which is written under a short lock because envs of every repo share the numbers.
+env_slot() {
+	local f=$envdir/$1.slot n=1
+	{
+		flock 6
+		if [ ! -s "$f" ]; then
+			while grep -qxFs -- "$n" "$envdir"/*.slot; do n=$((n + 1)); done
+			echo "$n" >"$f"
+		fi
+	} 6>"$envdir/slots.lock"
+	cat "$f"
+}
+
+# Prints field $2 of /proc/$1/stat (5 is the process group, 22 the start time); prints nothing when the process is gone. The comm field can hold spaces, so the fields are counted after its closing parenthesis.
+proc_field() { awk -v n="$2" '{ sub(/.*\) /, ""); print $(n - 2) }' "/proc/$1/stat" 2>/dev/null; }
+
+# Prints the pid that env $1's pid file records, and succeeds, only while a process with that pid and the recorded start time exists. A recycled pid has another start time, so it never passes.
+watch_pid() {
+	local pid start
+	read -r pid start 2>/dev/null <"$lockdir/watch/$1.pid" && [ -n "$start" ] && [ "$(proc_field "$pid" 22)" = "$start" ] && echo "$pid"
+}
+
+watch_alive() { watch_pid "$1" >/dev/null; }
+
+# Ends the watcher that env $1's pid file records, for pane $2, and waits up to 5 seconds for it to go, so the port it held is free before the lease is. $3 goes on the log line. Deletes the file afterwards. A watcher that has already exited leaves nothing to log, and a pid that is not the recorded process is never signalled.
+stop_watch() {
+	local pid
+	if pid=$(watch_pid "$1"); then
+		kill -- "-$pid" 2>/dev/null || true
+		for _ in {1..50}; do kill -0 -- "-$pid" 2>/dev/null || break; sleep 0.1; done
+		log watch-stopped "$1" "$label" pane "$2" pid "$pid" ${3:+"$3"}
+	fi
+	rm -f "$lockdir/watch/$1.pid"
+}
+
+# The holder: runs the wait as a child with fd 9 closed, so only the holder keeps the lease. A TERM from `envlock release` kills the whole process group, wait included, and logs nothing, because release logs it. Whichever way the lease ends, the env's watcher, which is a process group of its own, stops first.
 hold() {
 	local why='idle or done'
-	trap 'trap - TERM; kill 0' TERM
+	trap 'trap - TERM; stop_watch "$1" "$2"; kill 0' TERM
 	session_wait_idle "$2" 9>&- &
 	wait "$!" || why="wait failed, exit=$?"
+	stop_watch "$1" "$2"
 	log released "$1" "$label" pane "$2" "($why)"
+}
+
+# Starts env $1's watcher as a process group of its own and records its pid, which is the group id, and its start time for the holder to stop. A fresh shell sources the pool again, so the hook finds its helpers. A watcher that cannot start or dies early only leaves its reason in its log; it never fails the acquire.
+# The lock fds are closed on the process itself, not through `hook`: a shell that runs a function under a redirection keeps a copy of the closed fd until the function returns, and a watcher does not return.
+start_watch() {
+	local pid pg
+	mkdir -p "$lockdir/watch"
+	# shellcheck disable=SC2016  # $0 and $1 belong to the child shell.
+	ENVLOCK_ENV=$1 ENVLOCK_WORKTREE=$worktree setsid bash -c 'source "$0" && cd "$1" && envpool_watch' "$pool" "$worktree" 7>&- 8>&- 9>&- </dev/null >"$lockdir/watch/$1.log" 2>&1 &
+	pid=$!
+	# The holder kills this process group, so wait until setsid has made the watcher its leader.
+	while pg=$(proc_field "$pid" 5) && [ "$pg" != "$pid" ]; do sleep 0.01; done
+	echo "$pid $(proc_field "$pid" 22)" >"$lockdir/watch/$1.pid"
+	log watch "$1" "$label" pane "$session" pid "$pid"
 }
 
 # Fall back to the main checkout, so an untracked .envpool serves every worktree.
@@ -264,7 +316,7 @@ shrink() {
 				# Inside an if, set -e is off, so envpool_destroy has to return non-zero itself.
 				if ENVLOCK_ENV=$e hook envpool_destroy >&2; then
 					awk -v e="$e" '$0 != e' "$lockdir/envs" >"$lockdir/envs.tmp" && mv "$lockdir/envs.tmp" "$lockdir/envs"
-					rm -f "$envdir/$e".{holder,attached,suspended}
+					rm -f "$envdir/$e".{holder,attached,suspended,slot}
 					log shrunk "$e"
 					echo "envlock: removed $e" >&2
 					removed=1
@@ -379,7 +431,7 @@ try_order() {
 
 # Leaves the lease on fd 9 and its env name in $e; exits 75 when none frees up within $1 seconds.
 acquire() {
-	local deadline=$((SECONDS + $1)) grow_failed='' mismatch='' rc q=() order=() asks=("${need[@]/#/need=}" "${want[@]/#/want=}" ${urgent:+urgent} ${fresh:+fresh})
+	local deadline=$((SECONDS + $1)) grow_failed='' mismatch='' rc q=() order=() asks=("${need[@]/#/need=}" "${want[@]/#/want=}" ${urgent:+urgent} ${fresh:+fresh} ${watch:+watch})
 	# A leading 0 sorts an urgent entry before every timestamp, and urgent entries keep their timestamp order among themselves.
 	qentry="$queue/${urgent:+0}$(date +%s%N).$$"
 	echo "$worktree ($branch) pid $$" >"$qentry"
@@ -423,11 +475,14 @@ acquire() {
 		sleep 5
 	done
 	rm -f "$qentry"
-	export ENVLOCK_ENV=$e ENVLOCK_WORKTREE=$worktree
+	ENVLOCK_SLOT=$(env_slot "$e")
+	export ENVLOCK_ENV=$e ENVLOCK_WORKTREE=$worktree ENVLOCK_SLOT
 	# No pid yet, so find_lease ignores this record until the holder runs.
 	echo "$worktree ($branch) pane $session" >"$envdir/$e.holder"
 	# The env is leased now. Configure and reset run before envpool_attach starts it, so they may see it stopped.
 	rm -f "$envdir/$e.suspended"
+	# The lock proves no holder owns a watcher, so one that the pid file still records outlived its holder, which died without TERM.
+	stop_watch "$e" "$session" "(stale)"
 	# Written through a dot file and mv, so a shrink never reads half a record.
 	printf '%s\n%s\n' "$worktree" "$e" >"$last/.$$" && mv "$last/.$$" "$last/$(printf '%s' "$worktree" | sha1sum | cut -c1-40)"
 	# Not "using" yet: a caller that stops reading at this line must not take the env for leased.
@@ -452,8 +507,10 @@ acquire() {
 		log fresh "$e" "$label" pane "$session"
 	fi
 	stage=''
+	# The pid file is written before the holder starts, because the holder reads it when the lease ends.
+	if [ -n "$watch" ]; then start_watch "$e"; fi
 	# The holder inherits fd 9 and keeps the lease until the wait that it runs as a child returns.
-	setsid bash -c "$(declare -p lockdir label; declare -f log session_wait_idle hold); hold \"\$@\"" _ "$e" "$session" </dev/null >>"$lockdir/holder.log" 2>&1 &
+	setsid bash -c "$(declare -p lockdir label; declare -f log session_wait_idle proc_field watch_pid stop_watch hold); hold \"\$@\"" _ "$e" "$session" </dev/null >>"$lockdir/holder.log" 2>&1 &
 	echo "$worktree ($branch) pane $session pid $!" >"$envdir/$e.holder"
 	log leased "$e" "$label" pane "$session" pid "$!"
 	exec 9>&-
@@ -461,6 +518,8 @@ acquire() {
 	echo "$e"
 	show_info "$e"
 	trim_log
+	# The background grow, shrink and suspend run hooks for other envs, which must not see this env's slot.
+	unset ENVLOCK_SLOT
 	headroom || shrink_in_background
 }
 
@@ -497,13 +556,14 @@ status)
 acquire)
 	# A caller that closes the pipe (`| head -1`) then makes writes fail instead of killing envlock mid-attach with SIGPIPE.
 	trap '' PIPE
-	wait=0 urgent='' fresh=''
+	wait=0 urgent='' fresh='' watch=''
 	need=() want=()
 	while [ $# -gt 0 ]; do
 		case "$1" in
 		--wait) wait=$2; shift 2 ;;
 		--urgent) urgent=1; shift ;;
 		--fresh) fresh=1; shift ;;
+		--watch) watch=1; shift ;;
 		--need | --want)
 			[[ ${2:-} == ?*=?* ]] || { echo "envlock: $1 needs key=value" >&2; exit 2; }
 			if [ "$1" = --need ]; then need+=("$2"); else want+=("$2"); fi
@@ -517,8 +577,11 @@ acquire)
 		want=()
 	fi
 	[ -z "$fresh" ] || declare -F envpool_fresh >/dev/null || { echo "envlock: --fresh requires envpool_fresh in .envpool" >&2; exit 1; }
+	[ -z "$watch" ] || declare -F envpool_watch >/dev/null || { echo "envlock: --watch requires envpool_watch in .envpool" >&2; exit 1; }
 	session=$(session_id) || exit 1
 	if find_lease; then
+		ENVLOCK_SLOT=$(env_slot "$lease_env")
+		export ENVLOCK_SLOT
 		if ! needs_met "$lease_env"; then
 			declare -F envpool_configure >/dev/null || { echo "envlock: $lease_env lacks ${need[*]} and .envpool has no envpool_configure; run envlock release first" >&2; exit 1; }
 			run_configure "$lease_env" || exit 1
@@ -533,6 +596,8 @@ acquire)
 			fi
 			log fresh "$lease_env" "$label" pane "$session"
 		fi
+		# A watcher that is still running stays; one that is not gets replaced.
+		if [ -n "$watch" ] && ! watch_alive "$lease_env"; then start_watch "$lease_env"; fi
 		log reused "$lease_env" "$label" pane "$session"
 		echo "$lease_env"
 		show_info "$lease_env"
