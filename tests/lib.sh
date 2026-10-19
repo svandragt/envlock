@@ -9,10 +9,7 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 SCR=$(mktemp -d)
 mkdir "$SCR/bin"
 ln -s "$here/bin/herdr" "$SCR/bin/herdr"
-# ENVLOCK_BIN picks the file under test; a relative path is relative to the repo root.
-el_bin=${ENVLOCK_BIN:-bin/envlock}
-[[ $el_bin == /* ]] || el_bin=$here/../$el_bin
-ln -s "$el_bin" "$SCR/bin/envlock"
+ln -s "$here/../bin/envlock" "$SCR/bin/envlock"
 EL=$SCR/bin/envlock
 export PATH=$SCR/bin:$PATH XDG_STATE_HOME=$SCR/state
 pass=0 fail=0 PN=0 PANE='' OUT='' ERR='' RC=0 T='' LD='' ED=''
@@ -126,9 +123,9 @@ wait_pid() { pgrep -f "^bash $SCR/bin/herdr agent wait ${1:+$1 }" | head -1; }
 waits_for() { [ -n "$(wait_pid "$1")" ]; }
 nowait() { ! waits_for "$1"; }
 
-# The detached jobs run as a bash -c loop or as an interpreter running envlock with a hidden subcommand, so the patterns match either command line.
-bg_job="^(bash -c for s; do .* $SCR/bin/envlock |([^ ]*/)?python[0-9.]* $SCR/bin/envlock __background )"
-hold_job="^(bash -c declare -- lockdir=\"$SCR/|([^ ]*/)?python[0-9.]* $SCR/bin/envlock __hold )"
+# The detached jobs are the interpreter running envlock with a hidden subcommand.
+bg_job="^([^ ]*/)?python[0-9.]* $SCR/bin/envlock __background "
+hold_job="^([^ ]*/)?python[0-9.]* $SCR/bin/envlock __hold "
 
 # Waits for the detached shrink/suspend job that acquire starts.
 settle() { sleep 0.3; while pgrep -f "$bg_job" >/dev/null; do sleep 0.1; done; }

@@ -33,7 +33,7 @@ ln -s "$PWD/bin/envlock" ~/.local/bin/envlock
 ln -s "$PWD/skills/ticket-fleet" ~/.claude/skills/ticket-fleet
 ```
 
-envlock needs bash, git, `flock` (util-linux) and [herdr](https://herdr.dev). A lease belongs to the herdr agent that asked for it, so `envlock acquire` works only in a herdr pane.
+envlock needs Python 3.8 or later, bash (for the `.envpool` hooks), git and [herdr](https://herdr.dev). A lease belongs to the herdr agent that asked for it, so `envlock acquire` works only in a herdr pane.
 
 ### Set up a pool
 

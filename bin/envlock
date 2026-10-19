@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/usr/bin/env python3
 # Lease one environment from a repo's pool for as long as an agent session is busy.
 # Config: .envpool at the worktree root, sourced as bash. It sets ENVS=(...)
 # and may define envpool_reset and envpool_attach; both see ENVLOCK_ENV and
@@ -22,612 +22,891 @@
 # envpool_watch (sees ENVLOCK_ENV, ENVLOCK_WORKTREE and ENVLOCK_SLOT) runs a build watcher in the foreground; acquire --watch starts it, on a new lease or a reuse, and the holder stops it when the lease ends.
 # Every hook runs for a leased env with ENVLOCK_SLOT, a small number that stays the same for that env until it is destroyed.
 # Every hook runs with envlock's lock fds closed, so nothing a hook starts holds a lock.
-set -euo pipefail
+import fcntl
+import hashlib
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from contextlib import contextmanager
+from subprocess import DEVNULL, PIPE, STDOUT
 
-usage() {
-	echo "usage: envlock acquire [--wait SECONDS] [--urgent] [--fresh] [--watch] [--need KEY=VALUE]... [--want KEY=VALUE]..." >&2
-	echo "       envlock env" >&2
-	echo "       envlock release" >&2
-	echo "       envlock status" >&2
-	echo "       envlock grow" >&2
-	echo "       envlock shrink" >&2
-	echo "       envlock suspend" >&2
-	exit "${1:-2}"
-}
+USAGE = """usage: envlock acquire [--wait SECONDS] [--urgent] [--fresh] [--watch] [--need KEY=VALUE]... [--want KEY=VALUE]...
+       envlock env
+       envlock release
+       envlock status
+       envlock grow
+       envlock shrink
+       envlock suspend"""
 
-# Checked before any repo or pool lookup, so help works anywhere.
-case "${1:-}" in
-acquire | env | release | status | grow | shrink | suspend) ;;
--h | --help | help) usage 0 ;;
-*) usage ;;
-esac
+# close_fds keeps every lock fd away from the child. restore_signals=False hands acquire's ignored SIGPIPE on, as a shell does.
+POPEN = {"close_fds": True, "restore_signals": False}
 
-# Runs hook $1 with envlock's lock fds closed (7 the shrink or suspend candidate's lease, 8 the pool, 9 the lease), so neither the hook nor a child it leaves running inherits a lock that envlock still holds.
-hook() { "$@" 7>&- 8>&- 9>&-; }
+
+def emit(fd, msg):
+    # Writes straight to the fd: a closed pipe then makes the write fail instead of leaving buffered text that fails again at exit.
+    try:
+        os.write(fd, (msg + "\n").encode("utf-8", "surrogateescape"))
+        return True
+    except OSError:
+        return False
+
+
+def err(msg):
+    emit(2, msg)
+
+
+def usage(code=2):
+    err(USAGE)
+    sys.exit(code)
+
+
+def read(path):
+    """The file's text without trailing newlines, as $(cat file); None when it cannot be read."""
+    try:
+        with open(path, encoding="utf-8", errors="surrogateescape") as f:
+            return f.read().rstrip("\n")
+    except OSError:
+        return None
+
+
+def write(path, text):
+    with open(path, "w", encoding="utf-8", errors="surrogateescape") as f:
+        f.write(text)
+
+
+def rm(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def names(text):
+    """The non-blank lines of text, each once, in order."""
+    return list(dict.fromkeys(line for line in text.split("\n") if line.split()))
+
+
+def git(*args, cwd=None):
+    p = subprocess.run(["git", *args], stdout=PIPE, cwd=cwd, encoding="utf-8", errors="surrogateescape", check=False)
+    if p.returncode:
+        sys.exit(p.returncode)
+    return p.stdout.rstrip("\n")
+
+
+def lock_fd(fd, path):
+    """Opens path on exactly fd. Liveness is read from /proc/<pid>/fd/9, so the lease has to be on 9."""
+    opened = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
+    if opened != fd:
+        os.dup2(opened, fd)
+        os.close(opened)
+
+
+def try_lock(fd):
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
+@contextmanager
+def held(path, fd, block=False):
+    """Opens path on fd, takes its flock and yields whether it got it; closes fd afterwards."""
+    lock_fd(fd, path)
+    try:
+        if block:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        yield True if block else try_lock(fd)
+    finally:
+        os.close(fd)
+
+
+def is_free(path):
+    """True when nobody holds the lock on path right now."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_CREAT, 0o666)
+    except OSError:
+        return False
+    try:
+        return try_lock(fd)
+    finally:
+        os.close(fd)
+
 
 # These two functions are the only herdr-specific code.
-# Prints the id of the calling agent session; fails with a message when there is none.
-session_id() {
-	[ -n "${HERDR_PANE_ID:-}" ] || { echo "envlock: HERDR_PANE_ID is not set; run acquire from a herdr pane" >&2; return 1; }
-	command -v herdr >/dev/null || { echo "envlock: herdr is not on PATH" >&2; return 1; }
-	echo "$HERDR_PANE_ID"
-}
+def session_id():
+    """The id of the calling agent session; None, after a message, when there is none."""
+    pane = os.environ.get("HERDR_PANE_ID")
+    if not pane:
+        err("envlock: HERDR_PANE_ID is not set; run acquire from a herdr pane")
+    elif not shutil.which("herdr"):
+        err("envlock: herdr is not on PATH")
+    else:
+        return pane
+    return None
 
-# Blocks until session $1 is idle, done or gone; fails when it cannot wait. It does not exec: the holder runs it as a child and ends it by killing the process group.
-session_wait_idle() { herdr agent wait "$1" --until idle --until 'done'; }
 
-worktree=$(git rev-parse --show-toplevel)
-branch=$(git -C "$worktree" branch --show-current)
-# Names the worktree in the events log; a detached HEAD has no branch.
-label=${branch:-$(basename "$worktree")}
-# Locks live per repository, not per worktree, so every worktree shares one pool.
-common=$(cd "$worktree" && realpath "$(git rev-parse --git-common-dir)")
-state="${XDG_STATE_HOME:-$HOME/.local/state}/envlock"
-lockdir="$state/$(printf '%s' "$common" | sha1sum | cut -c1-12)"
-# Each env's .lock, .holder, .attached and .suspended files live here, outside the per-repo directory, so repos that list the same env share one lock.
-envdir="$state/envs"
-queue="$lockdir/queue"
-# One record per worktree: its path on line 1 and the env it leased last on line 2.
-last="$lockdir/last"
-mkdir -p "$queue" "$last" "$envdir"
+def session_wait_idle(pane):
+    """Starts a child that exits when session pane is idle, done or gone, and fails when it cannot wait. The holder waits for it and ends it by killing the process group."""
+    return subprocess.Popen(["herdr", "agent", "wait", pane, "--until", "idle", "--until", "done"], **POPEN)
 
-# Appends one line to the events log. A failing write never fails envlock.
-log() { printf '%s %s\n' "$(date +%FT%T)" "$*" >>"$lockdir/events.log" || true; }
 
-# Keeps the last 5000 lines of the events log once it passes 1 MiB.
-# shortcut: a line appended between the tail and the mv is lost; take the pool lock if lines ever matter.
-trim_log() {
-	[ "$(stat -c %s "$lockdir/events.log" 2>/dev/null || echo 0)" -gt 1048576 ] || return 0
-	tail -n 5000 "$lockdir/events.log" >"$lockdir/events.log.$$" && mv "$lockdir/events.log.$$" "$lockdir/events.log" || true
-}
+def log(*words):
+    """Appends one line to the events log. A failing write never fails envlock."""
+    line = f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {' '.join(map(str, words))}\n"
+    try:
+        with open(f"{lockdir}/events.log", "ab", buffering=0) as f:
+            f.write(line.encode("utf-8", "surrogateescape"))
+    except OSError:
+        pass
 
-# Prints env $1's slot. An env without one gets the lowest positive number that no env holds, which is written under a short lock because envs of every repo share the numbers.
-env_slot() {
-	local f=$envdir/$1.slot n=1
-	{
-		flock 6
-		if [ ! -s "$f" ]; then
-			while grep -qxFs -- "$n" "$envdir"/*.slot; do n=$((n + 1)); done
-			echo "$n" >"$f"
-		fi
-	} 6>"$envdir/slots.lock"
-	cat "$f"
-}
 
-# Prints field $2 of /proc/$1/stat (5 is the process group, 22 the start time); prints nothing when the process is gone. The comm field can hold spaces, so the fields are counted after its closing parenthesis.
-proc_field() { awk -v n="$2" '{ sub(/.*\) /, ""); print $(n - 2) }' "/proc/$1/stat" 2>/dev/null; }
+def trim_log():
+    """Keeps the last 5000 lines of the events log once it passes 1 MiB."""
+    # shortcut: a line appended between the read and the replace is lost; take the pool lock if lines ever matter.
+    path = f"{lockdir}/events.log"
+    try:
+        if os.stat(path).st_size <= 1048576:
+            return
+        with open(path, "rb") as f:
+            tail = f.readlines()[-5000:]
+        with open(f"{path}.{os.getpid()}", "wb") as f:
+            f.writelines(tail)
+        os.replace(f"{path}.{os.getpid()}", path)
+    except OSError:
+        pass
 
-# Prints the pid that env $1's pid file records, and succeeds, only while a process with that pid and the recorded start time exists. A recycled pid has another start time, so it never passes.
-watch_pid() {
-	local pid start
-	read -r pid start 2>/dev/null <"$lockdir/watch/$1.pid" && [ -n "$start" ] && [ "$(proc_field "$pid" 22)" = "$start" ] && echo "$pid"
-}
 
-watch_alive() { watch_pid "$1" >/dev/null; }
+def env_slot(env):
+    """Env's slot. An env without one gets the lowest positive number that no env holds, which is written under a short lock because envs of every repo share the numbers."""
+    path = f"{envdir}/{env}.slot"
+    with held(f"{envdir}/slots.lock", 6, block=True):
+        if not read(path):
+            used = {line for f in os.listdir(envdir) if f.endswith(".slot") and not f.startswith(".") for line in (read(f"{envdir}/{f}") or "").split("\n")}
+            n = 1
+            while str(n) in used:
+                n += 1
+            write(path, f"{n}\n")
+    return read(path)
 
-# Ends the watcher that env $1's pid file records, for pane $2, and waits up to 5 seconds for it to go, so the port it held is free before the lease is. $3 goes on the log line. Deletes the file afterwards. A watcher that has already exited leaves nothing to log, and a pid that is not the recorded process is never signalled.
-stop_watch() {
-	local pid
-	if pid=$(watch_pid "$1"); then
-		kill -- "-$pid" 2>/dev/null || true
-		for _ in {1..50}; do kill -0 -- "-$pid" 2>/dev/null || break; sleep 0.1; done
-		log watch-stopped "$1" "$label" pane "$2" pid "$pid" ${3:+"$3"}
-	fi
-	rm -f "$lockdir/watch/$1.pid"
-}
 
-# The holder: runs the wait as a child with fd 9 closed, so only the holder keeps the lease. A TERM from `envlock release` kills the whole process group, wait included, and logs nothing, because release logs it. Whichever way the lease ends, the env's watcher, which is a process group of its own, stops first.
-hold() {
-	local why='idle or done'
-	trap 'trap - TERM; stop_watch "$1" "$2"; kill 0' TERM
-	session_wait_idle "$2" 9>&- &
-	wait "$!" || why="wait failed, exit=$?"
-	stop_watch "$1" "$2"
-	log released "$1" "$label" pane "$2" "($why)"
-}
+def proc_field(pid, n):
+    """Field n of /proc/pid/stat (5 is the process group, 22 the start time); empty when the process is gone. The comm field can hold spaces, so the fields are counted after its closing parenthesis."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(") ", 1)[1].split()[n - 3]
+    except (OSError, IndexError):
+        return ""
 
-# Starts env $1's watcher as a process group of its own and records its pid, which is the group id, and its start time for the holder to stop. A fresh shell sources the pool again, so the hook finds its helpers. A watcher that cannot start or dies early only leaves its reason in its log; it never fails the acquire.
-# The lock fds are closed on the process itself, not through `hook`: a shell that runs a function under a redirection keeps a copy of the closed fd until the function returns, and a watcher does not return.
-start_watch() {
-	local pid pg
-	mkdir -p "$lockdir/watch"
-	# shellcheck disable=SC2016  # $0 and $1 belong to the child shell.
-	ENVLOCK_ENV=$1 ENVLOCK_WORKTREE=$worktree setsid bash -c 'source "$0" && cd "$1" && envpool_watch' "$pool" "$worktree" 7>&- 8>&- 9>&- </dev/null >"$lockdir/watch/$1.log" 2>&1 &
-	pid=$!
-	# The holder kills this process group, so wait until setsid has made the watcher its leader.
-	while pg=$(proc_field "$pid" 5) && [ "$pg" != "$pid" ]; do sleep 0.01; done
-	echo "$pid $(proc_field "$pid" 22)" >"$lockdir/watch/$1.pid"
-	log watch "$1" "$label" pane "$session" pid "$pid"
-}
 
-# Fall back to the main checkout, so an untracked .envpool serves every worktree.
-pool="$worktree/.envpool"
-[ -f "$pool" ] || pool="$(dirname "$common")/.envpool"
-[ -f "$pool" ] || { echo "envlock: no .envpool in $worktree or the main checkout; ask your agent to set up a pool (see README)" >&2; exit 1; }
-# shellcheck source=/dev/null
-source "$pool"
-# An empty ENVS is fine when the pool can grow from zero.
-[ "${#ENVS[@]}" -gt 0 ] || { [ "${ENVPOOL_MAX:-0}" -gt 0 ] && [ -n "${ENVPOOL_PREFIX:-}" ] && declare -F envpool_create >/dev/null; } ||
-	{ echo "envlock: .envpool sets no ENVS" >&2; exit 1; }
+def watch_pid(env):
+    """The pid that env's pid file records, only while a process with that pid and the recorded start time exists. A recycled pid has another start time, so it never passes."""
+    parts = (read(f"{lockdir}/watch/{env}.pid") or "").split("\n")[0].split(None, 1)
+    if len(parts) == 2 and parts[0].isdigit() and proc_field(parts[0], 22) == parts[1].strip():
+        return parts[0]
+    return None
 
-# The pool is ENVS plus the envs that growth has added.
-load_envs() {
-	mapfile -t all < <({ printf '%s\n' "${ENVS[@]}"; cat "$lockdir/envs" 2>/dev/null || true; } | awk 'NF && !seen[$0]++')
-}
 
-# Prints env $1's attributes; prints nothing when envpool_describe is missing or fails.
-describe() {
-	local out
-	if declare -F envpool_describe >/dev/null && out=$(ENVLOCK_ENV=$1 hook envpool_describe); then printf '%s\n' "$out"; fi
-}
+def stop_watch(env, pane, note=None):
+    """Ends the watcher that env's pid file records, for pane, and waits up to 5 seconds for it to go, so the port it held is free before the lease is. note goes on the log line. Deletes the file afterwards. A watcher that has already exited leaves nothing to log, and a pid that is not the recorded process is never signalled."""
+    pid = watch_pid(env)
+    if pid:
+        try:
+            os.killpg(int(pid), signal.SIGTERM)
+        except OSError:
+            pass
+        for _ in range(50):
+            try:
+                os.killpg(int(pid), 0)
+            except OSError:
+                break
+            time.sleep(0.1)
+        log("watch-stopped", env, label, "pane", pane, "pid", pid, *([note] if note else []))
+    rm(f"{lockdir}/watch/{env}.pid")
 
-# Succeeds when the attribute string $1 contains every pair after it.
-has_all() {
-	local attrs=$1 pair
-	shift
-	for pair in "$@"; do [[ " $attrs " == *" $pair "* ]] || return 1; done
-}
 
-# Succeeds when env $1 has every --need pair; with no --need every env does.
-needs_met() {
-	[ "${#need[@]}" -eq 0 ] || has_all "$(describe "$1")" "${need[@]}"
-}
+def hold(env, pane, ready):
+    """The holder: runs the wait as a child without fd 9, so only the holder keeps the lease. A TERM from `envlock release` kills the whole process group, wait included, and logs nothing, because release logs it. Whichever way the lease ends, the env's watcher, which is a process group of its own, stops first."""
+    why = "idle or done"
 
-# Runs envpool_configure on env $1 for the needed pairs. After a failure the env is in an unknown state, so the attach record goes.
-run_configure() {
-	local rc=0
-	echo "envlock: configuring $1 for ${need[*]}" >&2
-	ENVLOCK_ENV=$1 ENVLOCK_WORKTREE=$worktree hook envpool_configure "${need[@]}" >&2 || rc=$?
-	if [ "$rc" -ne 0 ]; then
-		log configure-failed "$1" "$label" pane "$session" "exit=$rc"
-		rm -f "$envdir/$1.attached"
-		echo "envlock: configuring $1 failed" >&2
-		return 1
-	fi
-}
+    def on_term(*_):
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        stop_watch(env, pane)
+        os.killpg(0, signal.SIGTERM)
 
-# Runs the optional envpool_info hook for env $1. Its output is a hint for the caller, so a failure never fails the acquire.
-show_info() {
-	if declare -F envpool_info >/dev/null; then ENVLOCK_ENV=$1 ENVLOCK_WORKTREE=$worktree hook envpool_info >&2 || true; fi
-}
+    signal.signal(signal.SIGTERM, on_term)
+    # acquire starts the holder with TERM blocked, so a release that comes at once waits for the handler.
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
+    child = session_wait_idle(pane)
+    # acquire waits for this close, so it returns only once the holder runs its wait.
+    os.close(int(ready))
+    rc = child.wait()
+    if rc:
+        why = f"wait failed, exit={rc if rc > 0 else 128 - rc}"
+    stop_watch(env, pane)
+    log("released", env, label, "pane", pane, f"({why})")
 
-can_grow() {
-	[ -n "${ENVPOOL_MAX:-}" ] && [ "${#all[@]}" -lt "$ENVPOOL_MAX" ] && declare -F envpool_create >/dev/null
-}
 
-can_suspend() { declare -F envpool_suspend >/dev/null; }
+def detach(args, log_path, pass_fds=()):
+    """Runs envlock args in a session of its own, with no stdin and the output appended to log_path."""
+    with open(log_path, "ab") as out:
+        return subprocess.Popen([sys.executable, sys.argv[0], *args], stdin=DEVNULL, stdout=out, stderr=STDOUT, start_new_session=True, pass_fds=pass_fds, **POPEN)
 
-# Prints the live queue entries oldest first and deletes the dead ones.
-# shortcut: kill -0 can match a recycled pid, so a dead waiter's entry may linger; store the process start time if that ever stalls the queue.
-queue_entries() {
-	local f
-	for f in "$queue"/*; do
-		[ -e "$f" ] || continue
-		if kill -0 "${f##*.}" 2>/dev/null; then echo "$f"; else rm -f "$f"; fi
-	done
-}
 
-# Succeeds when env $1 is an ENVS name that envpool_exists reports missing; envlock creates such a name only when the pool has both hooks.
-is_missing() {
-	[[ " ${ENVS[*]} " == *" $1 "* ]] && declare -F envpool_exists envpool_create >/dev/null && ! hook envpool_exists "$1"
-}
+def start_watch(env):
+    """Starts env's watcher as a process group of its own and records its pid, which is the group id, and its start time for the holder to stop. A fresh shell sources the pool again, so the hook finds its helpers. A watcher that cannot start or dies early only leaves its reason in its log; it never fails the acquire."""
+    os.makedirs(f"{lockdir}/watch", exist_ok=True)
+    with open(f"{lockdir}/watch/{env}.log", "wb") as out:
+        p = subprocess.Popen(
+            ["bash", "-c", 'source "$0" && cd "$1" && envpool_watch', pool, worktree],
+            env={**os.environ, "ENVLOCK_ENV": env, "ENVLOCK_WORKTREE": worktree},
+            stdin=DEVNULL, stdout=out, stderr=STDOUT, start_new_session=True, **POPEN,
+        )
+    write(f"{lockdir}/watch/{env}.pid", f"{p.pid} {proc_field(p.pid, 22)}\n")
+    log("watch", env, label, "pane", session, "pid", p.pid)
 
-# Succeeds when env $1 exists. A missing ENVS name is created first. That takes minutes, so a caller without --wait ($2 is 0) never does it.
-# The caller holds the env's lease lock, so nobody else creates or leases it meanwhile; the pool lock keeps a grow or shrink out. After a failed create the env stays unusable for the rest of this acquire.
-create_missing() {
-	is_missing "$1" || return 0
-	[ "$2" -gt 0 ] && [[ " ${create_failed:-} " != *" $1 "* ]] || return 1
-	{
-		flock -n 8 || return 1
-		echo "envlock: creating $1" >&2
-		# Inside an if, set -e is off, so envpool_create has to return non-zero itself.
-		if ENVLOCK_ENV=$1 hook envpool_create >&2; then
-			log created "$1"
-		else
-			log create-failed "$1" "exit=$?"
-			create_failed+=" $1"
-			echo "envlock: creating $1 failed" >&2
-			return 1
-		fi
-	} 8>"$lockdir/grow.lock"
-}
 
-# Returns 0 when an env was added, 1 when envpool_create failed, 2 when nothing was attempted.
-# With --capped it also refuses to go past ENVPOOL_MAX.
-grow() {
-	local n=2 new
-	{
-		flock -n 8 || { echo "envlock: another grow is running" >&2; return 2; }
-		load_envs
-		[ "${1:-}" != --capped ] || can_grow || return 2
-		{ declare -F envpool_create >/dev/null && [ -n "${ENVPOOL_PREFIX:-}" ]; } ||
-			{ echo "envlock: .envpool needs ENVPOOL_PREFIX and envpool_create to grow" >&2; return 2; }
-		new=$ENVPOOL_PREFIX$n
-		while [[ " ${all[*]} " == *" $new "* ]] || { declare -F envpool_exists >/dev/null && hook envpool_exists "$new"; }; do
-			n=$((n + 1))
-			new=$ENVPOOL_PREFIX$n
-		done
-		echo "envlock: creating $new" >&2
-		# Inside an if, set -e is off, so envpool_create has to return non-zero itself.
-		if ENVLOCK_ENV=$new hook envpool_create >&2; then
-			echo "$new" >>"$lockdir/envs"
-			log grown "$new"
-			echo "envlock: added $new" >&2
-		else
-			log grow-failed "$new" "exit=$?"
-			echo "envlock: creating $new failed, not added" >&2
-			return 1
-		fi
-	} 8>"$lockdir/grow.lock"
-}
+# Sources the pool and lists what it defines, NUL-separated, so Python knows which hooks exist.
+# The pool's own stdout goes to stderr, so it cannot end up in the list.
+LOADER = r"""set -euo pipefail
+source "$1" >&2
+for f in $(compgen -A function envpool_); do printf 'f:%s\0' "$f"; done
+for e in ${ENVS[@]+"${ENVS[@]}"}; do printf 'e:%s\0' "$e"; done
+printf 'm:%s\0p:%s\0' "${ENVPOOL_MAX:-}" "${ENVPOOL_PREFIX:-}"
+"""
 
-# Keeps one env free: when the lease just taken used the last one, grow in the background.
-# Returns 0 when it started a grow, 1 when it did not.
-headroom() {
-	local f
-	load_envs
-	can_grow || return 1
-	for f in "${all[@]}"; do
-		if flock -n "$envdir/$f.lock" true 2>/dev/null; then return 1; fi
-	done
-	echo "envlock: no free env left, growing in the background (log: $lockdir/grow.log)" >&2
-	# fd 9 is closed for the child so a long grow never holds the lease.
-	setsid "$0" grow --capped 9>&- </dev/null >>"$lockdir/grow.log" 2>&1 &
-}
 
-# Succeeds when a worktree that still exists last leased env $1. Deletes the records of worktrees that are gone.
-env_in_use() {
-	local f wt name used=1
-	for f in "$last"/*; do
-		[ -e "$f" ] || continue
-		{ IFS= read -r wt && IFS= read -r name; } <"$f" || true
-		if [ -d "$wt" ]; then [ "$name" != "$1" ] || used=0; else rm -f "$f"; fi
-	done
-	return "$used"
-}
+def load_pool():
+    global FUNCS, ENVS, MAX_RAW, MAX_N, PREFIX
+    p = subprocess.run(["bash", "-c", LOADER, "_", pool], stdout=PIPE, check=False, **POPEN)
+    if p.returncode:
+        sys.exit(p.returncode)
+    fields = p.stdout.decode("utf-8", "surrogateescape").split("\0")[:-1]
+    FUNCS = {f[2:] for f in fields if f.startswith("f:")}
+    ENVS = [f[2:] for f in fields if f.startswith("e:")]
+    MAX_RAW = next(f[2:] for f in fields if f.startswith("m:"))
+    PREFIX = next(f[2:] for f in fields if f.startswith("p:"))
+    try:
+        MAX_N = int(MAX_RAW)
+    except ValueError:
+        MAX_N = 0
 
-# Succeeds when an env other than $1 is free right now.
-other_free() {
-	local f
-	for f in "${all[@]}"; do
-		[ "$f" != "$1" ] || continue
-		if flock -n "$envdir/$f.lock" true 2>/dev/null; then return 0; fi
-	done
-	return 1
-}
 
-# Removes envs that growth added once no live worktree uses them, as long as another env stays free.
-# Returns 0 when it ran, 2 when it could not start.
-shrink() {
-	local e grown removed=''
-	declare -F envpool_destroy >/dev/null || { echo "envlock: .envpool needs envpool_destroy to shrink" >&2; return 2; }
-	# Fd 8 is the pool lock, fd 7 the candidate's lease lock.
-	{
-		flock -n 8 || { echo "envlock: a grow or shrink is running" >&2; return 2; }
-		mapfile -t grown < <(awk 'NF && !seen[$0]++' "$lockdir/envs" 2>/dev/null)
-		for e in "${grown[@]}"; do
-			[[ " ${ENVS[*]} " != *" $e "* ]] || continue
-			{
-				# Holding the lease lock stops anyone leasing $e while it is destroyed. The lock file is never deleted: a lease that races with the removal still locks the same inode, then finds the name gone.
-				flock -n 7 || continue
-				load_envs
-				if env_in_use "$e" || ! other_free "$e"; then continue; fi
-				echo "envlock: destroying $e" >&2
-				# Inside an if, set -e is off, so envpool_destroy has to return non-zero itself.
-				if ENVLOCK_ENV=$e hook envpool_destroy >&2; then
-					awk -v e="$e" '$0 != e' "$lockdir/envs" >"$lockdir/envs.tmp" && mv "$lockdir/envs.tmp" "$lockdir/envs"
-					rm -f "$envdir/$e".{holder,attached,suspended,slot}
-					log shrunk "$e"
-					echo "envlock: removed $e" >&2
-					removed=1
-				else
-					log destroy-failed "$e" "exit=$?"
-					echo "envlock: destroying $e failed, kept" >&2
-				fi
-			} 7>"$envdir/$e.lock"
-		done
-	} 8>"$lockdir/grow.lock"
-	# A lease may have taken the last free env during the destroy, when its own headroom could not grow.
-	[ -z "$removed" ] || headroom || true
-}
+# A plain call keeps errexit on inside the hook, so a failing step ends it; a call that a shell makes inside an if or || leaves it off, so the hook has to return non-zero itself.
+RUNNER = 'set -%spipefail; source "$1" >&2; shift; "$@"'
 
-# Stops the spare envs: pool envs that no live worktree last leased and nobody holds. The marker makes the next acquire run envpool_attach, which starts the env again.
-# Returns 0 when it ran, 2 when it could not start.
-suspend() {
-	local e
-	can_suspend || { echo "envlock: .envpool needs envpool_suspend to suspend" >&2; return 2; }
-	# Fd 8 is the pool lock, fd 7 the candidate's lease lock.
-	{
-		flock -n 8 || { echo "envlock: a grow or shrink is running" >&2; return 2; }
-		load_envs
-		for e in "${all[@]}"; do
-			[ ! -e "$envdir/$e.suspended" ] || continue
-			{
-				# Holding the lease lock stops anyone leasing $e while it is stopped.
-				flock -n 7 || continue
-				if env_in_use "$e"; then continue; fi
-				echo "envlock: suspending $e" >&2
-				# Deleted first, so a half-stopped env still gets envpool_attach on its next lease.
-				rm -f "$envdir/$e.attached"
-				# Inside an if, set -e is off, so envpool_suspend has to return non-zero itself.
-				if ENVLOCK_ENV=$e hook envpool_suspend >&2; then
-					touch "$envdir/$e.suspended"
-					log suspended "$e"
-					echo "envlock: suspended $e" >&2
-				else
-					log suspend-failed "$e" "exit=$?"
-					echo "envlock: suspending $e failed" >&2
-				fi
-			} 7>"$envdir/$e.lock"
-		done
-	} 8>"$lockdir/grow.lock"
-}
 
-# Starts a shrink, when growth has added envs and envpool_destroy can remove them, and then a suspend pass, when envpool_suspend exists, in one background job.
-shrink_in_background() {
-	local steps=()
-	if declare -F envpool_destroy >/dev/null && [ -s "$lockdir/envs" ]; then steps+=(shrink); fi
-	if can_suspend; then steps+=(suspend); fi
-	if [ "${#steps[@]}" -gt 0 ]; then
-		setsid bash -c "for s; do \"\$0\" \"\$s\"; done" "$0" "${steps[@]}" 9>&- </dev/null >>"$lockdir/grow.log" 2>&1 &
-	fi
-}
+def run_hook(name, *args, plain=False, out=None, **env):
+    """Runs hook name in a fresh bash that sources the pool. out is where its stdout goes: None keeps envlock's, 2 is stderr, PIPE captures it."""
+    p = subprocess.run(
+        ["bash", "-c", RUNNER % ("euo " if plain else "uo "), "_", pool, name, *args],
+        stdout=out, env={**os.environ, **env}, encoding="utf-8", errors="surrogateescape", check=False, **POPEN,
+    )
+    if p.returncode < 0:
+        p.returncode = 128 - p.returncode
+    return p
 
-# Sets lease_env, lease_pid and lease_pane when this worktree holds a live lease.
-find_lease() {
-	local holder
-	load_envs
-	for lease_env in "${all[@]}"; do
-		holder=$(cat "$envdir/$lease_env.holder" 2>/dev/null) || continue
-		[[ $holder == "$worktree ("* ]] || continue
-		lease_pid=${holder##* pid }
-		lease_pane=${holder##* pane }
-		lease_pane=${lease_pane%% *}
-		# Holder files outlive their lease, so only trust a pid that still has this env's lock open.
-		[ "$(readlink "/proc/$lease_pid/fd/9" 2>/dev/null)" = "$envdir/$lease_env.lock" ] && return 0
-	done
-	return 1
-}
 
-# Ends the lease that this pane holds for another worktree, because a pane holds one lease at a time. Needs load_envs first.
-release_pane_lease() {
-	local e holder pid wt name
-	for e in "${all[@]}"; do
-		holder=$(cat "$envdir/$e.holder" 2>/dev/null) || continue
-		[[ $holder == *" pane $session pid "* ]] || continue
-		pid=${holder##* pid }
-		[ "$(readlink "/proc/$pid/fd/9" 2>/dev/null)" = "$envdir/$e.lock" ] || continue
-		wt=${holder%% (*}
-		name=${holder#"$wt ("}
-		name=${name%%) pane *}
-		kill "$pid" || continue
-		log released "$e" "${name:-$(basename "$wt")}" pane "$session" "(moved to $label)"
-		# The holder ends asynchronously; the acquire that follows should find this env free.
-		for _ in {1..50}; do flock -n "$envdir/$e.lock" true 2>/dev/null && break; sleep 0.1; done
-	done
-}
+def hook(name, *args, **kw):
+    return run_hook(name, *args, **kw).returncode
 
-# Prints the pool in the order acquire tries it: envs with the needed attributes before the rest, then envs with the wanted ones, then envs whose holder names this worktree. Envs that still have to be created come after all the others, because creating takes minutes.
-# Without envpool_configure an env that lacks a needed pair is left out.
-try_order() {
-	local e r attrs n w h m
-	local -A tier
-	for e in "${all[@]}"; do
-		attrs='' n=0 w=0 h=0 m=0
-		! is_missing "$e" || m=8
-		[ $((${#need[@]} + ${#want[@]})) -eq 0 ] || [ "$m" -ne 0 ] || attrs=$(describe "$e")
-		has_all "$attrs" "${need[@]}" || n=4
-		has_all "$attrs" "${want[@]}" || w=2
-		[[ $(cat "$envdir/$e.holder" 2>/dev/null) == "$worktree ("* ]] || h=1
-		tier[$e]=$((n + w + h + m))
-	done
-	for r in {0..15}; do
-		if [ $((r % 8)) -ge 4 ] && ! declare -F envpool_configure >/dev/null; then continue; fi
-		for e in "${all[@]}"; do
-			if [ "${tier[$e]}" = "$r" ]; then echo "$e"; fi
-		done
-	done
-}
 
-# Leaves the lease on fd 9 and its env name in $e; exits 75 when none frees up within $1 seconds.
-acquire() {
-	local deadline=$((SECONDS + $1)) grow_failed='' mismatch='' rc q=() order=() asks=("${need[@]/#/need=}" "${want[@]/#/want=}" ${urgent:+urgent} ${fresh:+fresh} ${watch:+watch})
-	# A leading 0 sorts an urgent entry before every timestamp, and urgent entries keep their timestamp order among themselves.
-	qentry="$queue/${urgent:+0}$(date +%s%N).$$"
-	echo "$worktree ($branch) pid $$" >"$qentry"
-	# Names the hook that is running, so the EXIT trap can log it when set -e ends the script.
-	stage=''
-	trap 'rc=$?; [ -z "$stage" ] || log "$stage-failed" "$e" "$label" pane "$session" "exit=$rc"; rm -f "$qentry"' EXIT
-	log queued "$label" pane "$session" "${asks[@]}"
-	while :; do
-		mapfile -t q < <(queue_entries)
-		if [ "${q[0]:-}" = "$qentry" ]; then
-			load_envs
-			# An env whose holder file still names this worktree already serves its code, so it ranks first.
-			mapfile -t order < <(try_order)
-			for e in "${order[@]}"; do
-				# Test seam: lets a test change the pool just before the lock is taken, as a shrink that finishes first would. Real pools do not need it.
-				if declare -F envpool_before_lock >/dev/null; then ENVLOCK_ENV=$e hook envpool_before_lock >&2 || true; fi
-				exec 9>"$envdir/$e.lock"
-				if flock -n 9; then
-					# A shrink drops a name from the pool while it holds the lock, so a name that is gone is not leasable.
-					load_envs
-					if [[ " ${all[*]} " == *" $e "* ]] && create_missing "$e" "$1"; then
-						# The env may have changed since it was ranked, so the needs are checked again under the lock.
-						mismatch=''
-						needs_met "$e" || mismatch=1
-						if [ -z "$mismatch" ] || declare -F envpool_configure >/dev/null; then break 2; fi
-					fi
-				fi
-				exec 9>&-
-			done
-			# Growing takes minutes, so a fail-fast caller never waits for it.
-			if [ "$1" -gt 0 ] && [ -z "$grow_failed" ] && can_grow; then
-				rc=0
-				grow --capped || rc=$?
-				[ "$rc" -ne 1 ] || grow_failed=1
-				[ "$rc" -ne 0 ] || continue
-			fi
-		fi
-		[ "$SECONDS" -lt "$deadline" ] || {
-			echo "envlock: all environments busy${need[*]:+ or lacking ${need[*]}}" >&2 || true
-			log timeout "$label" pane "$session" "${asks[@]}"
-			exit 75
-		}
-		# ENVLOCK_POLL is a test seam: it lets the tests poll faster than every 5 seconds.
-		sleep "${ENVLOCK_POLL:-5}"
-	done
-	rm -f "$qentry"
-	ENVLOCK_SLOT=$(env_slot "$e")
-	export ENVLOCK_ENV=$e ENVLOCK_WORKTREE=$worktree ENVLOCK_SLOT
-	# No pid yet, so find_lease ignores this record until the holder runs.
-	echo "$worktree ($branch) pane $session" >"$envdir/$e.holder"
-	# The env is leased now. Configure and reset run before envpool_attach starts it, so they may see it stopped.
-	rm -f "$envdir/$e.suspended"
-	# The lock proves no holder owns a watcher, so one that the pid file still records outlived its holder, which died without TERM.
-	stop_watch "$e" "$session" "(stale)"
-	# Written through a dot file and mv, so a shrink never reads half a record.
-	printf '%s\n%s\n' "$worktree" "$e" >"$last/.$$" && mv "$last/.$$" "$last/$(printf '%s' "$worktree" | sha1sum | cut -c1-40)"
-	# Not "using" yet: a caller that stops reading at this line must not take the env for leased.
-	echo "envlock: preparing $e" >&2 || true
-	[ -z "$mismatch" ] || run_configure "$e" || exit 1
-	# Hook output goes to stderr, so stdout carries only the env name. The hooks below run as plain commands, so set -e applies inside them; set -e ends the script with the hook's status, which the EXIT trap logs.
-	if declare -F envpool_reset >/dev/null; then stage=reset; hook envpool_reset >&2; fi
-	if declare -F envpool_attach >/dev/null; then
-		if [ "$(cat "$envdir/$e.attached" 2>/dev/null)" = "$worktree" ] && { ! declare -F envpool_healthy >/dev/null || hook envpool_healthy >&2; }; then
-			echo "envlock: $e already serves $worktree" >&2 || true
-		else
-			# The record is written only after a switch that succeeded; a failing hook exits under set -e before it.
-			rm -f "$envdir/$e.attached"
-			stage=attach
-			hook envpool_attach >&2
-			printf '%s\n' "$worktree" >"$envdir/$e.attached"
-		fi
-	fi
-	if [ -n "$fresh" ]; then
-		stage=fresh
-		hook envpool_fresh >&2
-		log fresh "$e" "$label" pane "$session"
-	fi
-	stage=''
-	# The pid file is written before the holder starts, because the holder reads it when the lease ends.
-	if [ -n "$watch" ]; then start_watch "$e"; fi
-	# The holder inherits fd 9 and keeps the lease until the wait that it runs as a child returns.
-	setsid bash -c "$(declare -p lockdir label; declare -f log session_wait_idle proc_field watch_pid stop_watch hold); hold \"\$@\"" _ "$e" "$session" </dev/null >>"$lockdir/holder.log" 2>&1 &
-	echo "$worktree ($branch) pane $session pid $!" >"$envdir/$e.holder"
-	log leased "$e" "$label" pane "$session" pid "$!"
-	exec 9>&-
-	echo "envlock: using $e" >&2 || true
-	echo "$e"
-	show_info "$e"
-	trim_log
-	# The background grow, shrink and suspend run hooks for other envs, which must not see this env's slot.
-	unset ENVLOCK_SLOT
-	headroom || shrink_in_background
-}
+def load_envs():
+    """The pool is ENVS plus the envs that growth has added."""
+    global ALL
+    ALL = names("\n".join(ENVS) + "\n" + (read(f"{lockdir}/envs") or ""))
 
-cmd=${1:-}; shift || true
-case "$cmd" in
-status)
-	load_envs
-	busy=0 absent=0
-	lines=()
-	for e in "${all[@]}"; do
-		if is_missing "$e"; then
-			absent=$((absent + 1))
-			lines+=("$e  not created")
-			continue
-		fi
-		attrs=$(describe "$e")
-		if flock -n "$envdir/$e.lock" true 2>/dev/null; then
-			susp=''
-			[ ! -e "$envdir/$e.suspended" ] || susp=', suspended'
-			lines+=("$e  free$susp${attrs:+  $attrs}")
-		else
-			busy=$((busy + 1))
-			lines+=("$e  held by $(cat "$envdir/$e.holder" 2>/dev/null || echo unknown)${attrs:+  $attrs}")
-		fi
-	done
-	mapfile -t q < <(queue_entries)
-	echo "$busy/${#all[@]} in use, $((${#all[@]} - busy - absent)) free, ${#q[@]} queued, cap ${ENVPOOL_MAX:-none}"
-	[ "${#lines[@]}" -eq 0 ] || printf '%s\n' "${lines[@]}"
-	for i in "${!q[@]}"; do
-		echo "queued $((i + 1))  $(cat "${q[$i]}" 2>/dev/null || true)"
-	done
-	echo "events log: $lockdir/events.log"
-	;;
-acquire)
-	# A caller that closes the pipe (`| head -1`) then makes writes fail instead of killing envlock mid-attach with SIGPIPE.
-	trap '' PIPE
-	wait=0 urgent='' fresh='' watch=''
-	need=() want=()
-	while [ $# -gt 0 ]; do
-		case "$1" in
-		--wait) wait=$2; shift 2 ;;
-		--urgent) urgent=1; shift ;;
-		--fresh) fresh=1; shift ;;
-		--watch) watch=1; shift ;;
-		--need | --want)
-			[[ ${2:-} == ?*=?* ]] || { echo "envlock: $1 needs key=value" >&2; exit 2; }
-			if [ "$1" = --need ]; then need+=("$2"); else want+=("$2"); fi
-			shift 2 ;;
-		*) usage ;;
-		esac
-	done
-	if ! declare -F envpool_describe >/dev/null; then
-		[ "${#need[@]}" -eq 0 ] || { echo "envlock: --need requires envpool_describe in .envpool" >&2; exit 1; }
-		[ "${#want[@]}" -eq 0 ] || echo "envlock: ignoring --want, .envpool has no envpool_describe" >&2 || true
-		want=()
-	fi
-	[ -z "$fresh" ] || declare -F envpool_fresh >/dev/null || { echo "envlock: --fresh requires envpool_fresh in .envpool" >&2; exit 1; }
-	[ -z "$watch" ] || declare -F envpool_watch >/dev/null || { echo "envlock: --watch requires envpool_watch in .envpool" >&2; exit 1; }
-	session=$(session_id) || exit 1
-	if find_lease; then
-		ENVLOCK_SLOT=$(env_slot "$lease_env")
-		export ENVLOCK_SLOT
-		if ! needs_met "$lease_env"; then
-			declare -F envpool_configure >/dev/null || { echo "envlock: $lease_env lacks ${need[*]} and .envpool has no envpool_configure; run envlock release first" >&2; exit 1; }
-			run_configure "$lease_env" || exit 1
-		fi
-		if [ -n "$fresh" ]; then
-			rc=0
-			ENVLOCK_ENV=$lease_env ENVLOCK_WORKTREE=$worktree hook envpool_fresh >&2 || rc=$?
-			if [ "$rc" -ne 0 ]; then
-				log fresh-failed "$lease_env" "$label" pane "$session" "exit=$rc"
-				echo "envlock: refreshing $lease_env failed; the lease is unchanged" >&2
-				exit "$rc"
-			fi
-			log fresh "$lease_env" "$label" pane "$session"
-		fi
-		# A watcher that is still running stays; one that is not gets replaced.
-		if [ -n "$watch" ] && ! watch_alive "$lease_env"; then start_watch "$lease_env"; fi
-		log reused "$lease_env" "$label" pane "$session"
-		echo "$lease_env"
-		show_info "$lease_env"
-		exit 0
-	fi
-	release_pane_lease
-	acquire "$wait"
-	;;
-env)
-	find_lease || exit 1
-	echo "$lease_env"
-	;;
-release)
-	find_lease || { echo "envlock: no lease held by $worktree"; exit 0; }
-	kill "$lease_pid"
-	log released "$lease_env" "$label" pane "$lease_pane" "(release)"
-	echo "envlock: released $lease_env (pid $lease_pid)"
-	;;
-grow)
-	# A grow that acquire runs itself does not suspend: the waiter takes the new env at once.
-	grow "${1:-}" && { ! can_suspend || suspend; }
-	;;
-shrink)
-	shrink
-	;;
-suspend)
-	suspend
-	;;
-*) usage ;;
-esac
+
+def describe(env):
+    """Env's attributes; empty when envpool_describe is missing or fails."""
+    if "envpool_describe" not in FUNCS:
+        return ""
+    p = run_hook("envpool_describe", out=PIPE, ENVLOCK_ENV=env)
+    return p.stdout.rstrip("\n") if p.returncode == 0 else ""
+
+
+def has_all(attrs, pairs):
+    return all(f" {pair} " in f" {attrs} " for pair in pairs)
+
+
+def needs_met(env):
+    """True when env has every --need pair; with no --need every env does."""
+    return not need or has_all(describe(env), need)
+
+
+def run_configure(env):
+    """Runs envpool_configure on env for the needed pairs. After a failure the env is in an unknown state, so the attach record goes."""
+    err(f"envlock: configuring {env} for {' '.join(need)}")
+    rc = hook("envpool_configure", *need, out=2, ENVLOCK_ENV=env, ENVLOCK_WORKTREE=worktree)
+    if rc:
+        log("configure-failed", env, label, "pane", session, f"exit={rc}")
+        rm(f"{envdir}/{env}.attached")
+        err(f"envlock: configuring {env} failed")
+        return False
+    return True
+
+
+def show_info(env):
+    """Runs the optional envpool_info hook. Its output is a hint for the caller, so a failure never fails the acquire."""
+    if "envpool_info" in FUNCS:
+        hook("envpool_info", out=2, ENVLOCK_ENV=env, ENVLOCK_WORKTREE=worktree)
+
+
+def can_grow():
+    return MAX_RAW != "" and len(ALL) < MAX_N and "envpool_create" in FUNCS
+
+
+def can_suspend():
+    return "envpool_suspend" in FUNCS
+
+
+def queue_entries():
+    """The live queue entries oldest first; deletes the dead ones."""
+    # shortcut: kill -0 can match a recycled pid, so a dead waiter's entry may linger; store the process start time if that ever stalls the queue.
+    live = []
+    for f in sorted(os.listdir(queue_dir)):
+        if f.startswith("."):
+            continue
+        try:
+            os.kill(int(f.rsplit(".", 1)[1]), 0)
+            live.append(f"{queue_dir}/{f}")
+        except (OSError, ValueError, IndexError):
+            rm(f"{queue_dir}/{f}")
+    return live
+
+
+def is_missing(env):
+    """True when env is an ENVS name that envpool_exists reports missing; envlock creates such a name only when the pool has both hooks."""
+    return env in ENVS and "envpool_exists" in FUNCS and "envpool_create" in FUNCS and hook("envpool_exists", env) != 0
+
+
+def create_missing(env, wait, create_failed):
+    """True when env exists. A missing ENVS name is created first. That takes minutes, so a caller without --wait never does it.
+    The caller holds the env's lease lock, so nobody else creates or leases it meanwhile; the pool lock keeps a grow or shrink out. After a failed create the env stays unusable for the rest of this acquire."""
+    if not is_missing(env):
+        return True
+    if wait <= 0 or env in create_failed:
+        return False
+    with held(f"{lockdir}/grow.lock", 8) as got:
+        if not got:
+            return False
+        err(f"envlock: creating {env}")
+        rc = hook("envpool_create", out=2, ENVLOCK_ENV=env)
+        if rc == 0:
+            log("created", env)
+            return True
+        log("create-failed", env, f"exit={rc}")
+        create_failed.add(env)
+        err(f"envlock: creating {env} failed")
+        return False
+
+
+def grow(arg):
+    """Returns 0 when an env was added, 1 when envpool_create failed, 2 when nothing was attempted.
+    With --capped it also refuses to go past ENVPOOL_MAX."""
+    with held(f"{lockdir}/grow.lock", 8) as got:
+        if not got:
+            err("envlock: another grow is running")
+            return 2
+        load_envs()
+        if arg == "--capped" and not can_grow():
+            return 2
+        if "envpool_create" not in FUNCS or not PREFIX:
+            err("envlock: .envpool needs ENVPOOL_PREFIX and envpool_create to grow")
+            return 2
+        n = 2
+        while f"{PREFIX}{n}" in ALL or ("envpool_exists" in FUNCS and hook("envpool_exists", f"{PREFIX}{n}") == 0):
+            n += 1
+        new = f"{PREFIX}{n}"
+        err(f"envlock: creating {new}")
+        rc = hook("envpool_create", out=2, ENVLOCK_ENV=new)
+        if rc:
+            log("grow-failed", new, f"exit={rc}")
+            err(f"envlock: creating {new} failed, not added")
+            return 1
+        with open(f"{lockdir}/envs", "a") as f:
+            f.write(f"{new}\n")
+        log("grown", new)
+        err(f"envlock: added {new}")
+        return 0
+
+
+def headroom():
+    """Keeps one env free: when the lease just taken used the last one, grow in the background. True when it started a grow."""
+    load_envs()
+    if not can_grow() or any(is_free(f"{envdir}/{f}.lock") for f in ALL):
+        return False
+    err(f"envlock: no free env left, growing in the background (log: {lockdir}/grow.log)")
+    detach(["grow", "--capped"], f"{lockdir}/grow.log")
+    return True
+
+
+def env_in_use(env):
+    """True when a worktree that still exists last leased env. Deletes the records of worktrees that are gone."""
+    used = False
+    for f in sorted(os.listdir(last_dir)):
+        if f.startswith("."):
+            continue
+        wt, _, name = (read(f"{last_dir}/{f}") or "").partition("\n")
+        if os.path.isdir(wt):
+            used = used or name.split("\n")[0] == env
+        else:
+            rm(f"{last_dir}/{f}")
+    return used
+
+
+def other_free(env):
+    """True when an env other than env is free right now."""
+    return any(f != env and is_free(f"{envdir}/{f}.lock") for f in ALL)
+
+
+def shrink():
+    """Removes envs that growth added once no live worktree uses them, as long as another env stays free.
+    Returns 0 when it ran, 2 when it could not start."""
+    if "envpool_destroy" not in FUNCS:
+        err("envlock: .envpool needs envpool_destroy to shrink")
+        return 2
+    removed = False
+    # Fd 8 is the pool lock, fd 7 the candidate's lease lock.
+    with held(f"{lockdir}/grow.lock", 8) as got:
+        if not got:
+            err("envlock: a grow or shrink is running")
+            return 2
+        for e in names(read(f"{lockdir}/envs") or ""):
+            if e in ENVS:
+                continue
+            # Holding the lease lock stops anyone leasing e while it is destroyed. The lock file is never deleted: a lease that races with the removal still locks the same inode, then finds the name gone.
+            with held(f"{envdir}/{e}.lock", 7) as mine:
+                if not mine:
+                    continue
+                load_envs()
+                if env_in_use(e) or not other_free(e):
+                    continue
+                err(f"envlock: destroying {e}")
+                rc = hook("envpool_destroy", out=2, ENVLOCK_ENV=e)
+                if rc == 0:
+                    keep = [x for x in (read(f"{lockdir}/envs") or "").split("\n") if x and x != e]
+                    write(f"{lockdir}/envs.tmp", "".join(f"{x}\n" for x in keep))
+                    os.replace(f"{lockdir}/envs.tmp", f"{lockdir}/envs")
+                    for ext in ("holder", "attached", "suspended", "slot"):
+                        rm(f"{envdir}/{e}.{ext}")
+                    log("shrunk", e)
+                    err(f"envlock: removed {e}")
+                    removed = True
+                else:
+                    log("destroy-failed", e, f"exit={rc}")
+                    err(f"envlock: destroying {e} failed, kept")
+    # A lease may have taken the last free env during the destroy, when its own headroom could not grow.
+    if removed:
+        headroom()
+    return 0
+
+
+def suspend():
+    """Stops the spare envs: pool envs that no live worktree last leased and nobody holds. The marker makes the next acquire run envpool_attach, which starts the env again.
+    Returns 0 when it ran, 2 when it could not start."""
+    if not can_suspend():
+        err("envlock: .envpool needs envpool_suspend to suspend")
+        return 2
+    # Fd 8 is the pool lock, fd 7 the candidate's lease lock.
+    with held(f"{lockdir}/grow.lock", 8) as got:
+        if not got:
+            err("envlock: a grow or shrink is running")
+            return 2
+        load_envs()
+        for e in ALL:
+            if os.path.exists(f"{envdir}/{e}.suspended"):
+                continue
+            # Holding the lease lock stops anyone leasing e while it is stopped.
+            with held(f"{envdir}/{e}.lock", 7) as mine:
+                if not mine or env_in_use(e):
+                    continue
+                err(f"envlock: suspending {e}")
+                # Deleted first, so a half-stopped env still gets envpool_attach on its next lease.
+                rm(f"{envdir}/{e}.attached")
+                rc = hook("envpool_suspend", out=2, ENVLOCK_ENV=e)
+                if rc == 0:
+                    write(f"{envdir}/{e}.suspended", "")
+                    log("suspended", e)
+                    err(f"envlock: suspended {e}")
+                else:
+                    log("suspend-failed", e, f"exit={rc}")
+                    err(f"envlock: suspending {e} failed")
+    return 0
+
+
+def shrink_in_background():
+    """Starts a shrink, when growth has added envs and envpool_destroy can remove them, and then a suspend pass, when envpool_suspend exists, in one background job."""
+    steps = []
+    if "envpool_destroy" in FUNCS and os.path.exists(f"{lockdir}/envs") and os.path.getsize(f"{lockdir}/envs") > 0:
+        steps.append("shrink")
+    if can_suspend():
+        steps.append("suspend")
+    if steps:
+        detach(["__background", *steps], f"{lockdir}/grow.log")
+
+
+def find_lease():
+    """(env, pid, pane) when this worktree holds a live lease, else None."""
+    load_envs()
+    for env in ALL:
+        holder = read(f"{envdir}/{env}.holder")
+        if holder is None or not holder.startswith(f"{worktree} ("):
+            continue
+        pid = holder.rsplit(" pid ", 1)[-1]
+        pane = holder.rsplit(" pane ", 1)[-1].split(" ")[0]
+        # Holder files outlive their lease, so only trust a pid that still has this env's lock open.
+        if readlink9(pid) == f"{envdir}/{env}.lock":
+            return env, pid, pane
+    return None
+
+
+def readlink9(pid):
+    try:
+        return os.readlink(f"/proc/{pid}/fd/9")
+    except OSError:
+        return None
+
+
+def release_pane_lease():
+    """Ends the lease that this pane holds for another worktree, because a pane holds one lease at a time. Needs load_envs first."""
+    for e in ALL:
+        holder = read(f"{envdir}/{e}.holder")
+        if holder is None or f" pane {session} pid " not in holder:
+            continue
+        pid = holder.rsplit(" pid ", 1)[-1]
+        if readlink9(pid) != f"{envdir}/{e}.lock":
+            continue
+        wt = holder.partition(" (")[0]
+        name = holder[len(wt) + 2:].partition(") pane ")[0] if holder.startswith(f"{wt} (") else holder
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+        except (OSError, ValueError):
+            continue
+        log("released", e, name or os.path.basename(wt), "pane", session, f"(moved to {label})")
+        # The holder ends asynchronously; the acquire that follows should find this env free.
+        for _ in range(50):
+            if is_free(f"{envdir}/{e}.lock"):
+                break
+            time.sleep(0.1)
+
+
+def try_order():
+    """The pool in the order acquire tries it: envs with the needed attributes before the rest, then envs with the wanted ones, then envs whose holder names this worktree. Envs that still have to be created come after all the others, because creating takes minutes.
+    Without envpool_configure an env that lacks a needed pair is left out."""
+    tier = {}
+    for e in ALL:
+        attrs = ""
+        m = 8 if is_missing(e) else 0
+        if (need or want) and not m:
+            attrs = describe(e)
+        n = 0 if has_all(attrs, need) else 4
+        w = 0 if has_all(attrs, want) else 2
+        h = 0 if (read(f"{envdir}/{e}.holder") or "").startswith(f"{worktree} (") else 1
+        tier[e] = n + w + h + m
+    order = []
+    for r in range(16):
+        if r % 8 >= 4 and "envpool_configure" not in FUNCS:
+            continue
+        order += [e for e in ALL if tier[e] == r]
+    return order
+
+
+def run_plain(stage, hook_name, env):
+    """Runs a hook that has to succeed. The hook's status ends envlock, and the failure is logged under the stage's name."""
+    rc = hook(hook_name, plain=True, out=2)
+    if rc:
+        log(f"{stage}-failed", env, label, "pane", session, f"exit={rc}")
+        sys.exit(rc)
+
+
+def acquire(wait):
+    """Leaves the lease on fd 9 and its env name in e; exits 75 when none frees up within wait seconds."""
+    deadline = time.monotonic() + wait
+    grow_failed = mismatch = False
+    create_failed = set()
+    asks = [f"need={p}" for p in need] + [f"want={p}" for p in want] + [k for k, v in (("urgent", urgent), ("fresh", fresh), ("watch", watch)) if v]
+    # A leading 0 sorts an urgent entry before every timestamp, and urgent entries keep their timestamp order among themselves.
+    qentry = f"{queue_dir}/{'0' if urgent else ''}{time.time_ns()}.{os.getpid()}"
+    write(qentry, f"{worktree} ({branch}) pid {os.getpid()}\n")
+    try:
+        log("queued", label, "pane", session, *asks)
+        e = None
+        while True:
+            q = queue_entries()
+            if q and q[0] == qentry:
+                load_envs()
+                # An env whose holder file still names this worktree already serves its code, so it ranks first.
+                for cand in try_order():
+                    # Test seam: lets a test change the pool just before the lock is taken, as a shrink that finishes first would. Real pools do not need it.
+                    if "envpool_before_lock" in FUNCS:
+                        hook("envpool_before_lock", out=2, ENVLOCK_ENV=cand)
+                    lock_fd(9, f"{envdir}/{cand}.lock")
+                    if try_lock(9):
+                        # A shrink drops a name from the pool while it holds the lock, so a name that is gone is not leasable.
+                        load_envs()
+                        if cand in ALL and create_missing(cand, wait, create_failed):
+                            # The env may have changed since it was ranked, so the needs are checked again under the lock.
+                            mismatch = not needs_met(cand)
+                            if not mismatch or "envpool_configure" in FUNCS:
+                                e = cand
+                                break
+                    os.close(9)
+                if e:
+                    break
+                # Growing takes minutes, so a fail-fast caller never waits for it.
+                if wait > 0 and not grow_failed and can_grow():
+                    rc = grow("--capped")
+                    grow_failed = grow_failed or rc == 1
+                    if rc == 0:
+                        continue
+            if time.monotonic() >= deadline:
+                err(f"envlock: all environments busy{' or lacking ' + ' '.join(need) if need else ''}")
+                log("timeout", label, "pane", session, *asks)
+                sys.exit(75)
+            # ENVLOCK_POLL is a test seam: it lets the tests poll faster than every 5 seconds.
+            time.sleep(float(os.environ.get("ENVLOCK_POLL") or 5))
+        rm(qentry)
+        slot = env_slot(e)
+        os.environ.update(ENVLOCK_ENV=e, ENVLOCK_WORKTREE=worktree, ENVLOCK_SLOT=slot)
+        # No pid yet, so find_lease ignores this record until the holder runs.
+        write(f"{envdir}/{e}.holder", f"{worktree} ({branch}) pane {session}\n")
+        # The env is leased now. Configure and reset run before envpool_attach starts it, so they may see it stopped.
+        rm(f"{envdir}/{e}.suspended")
+        # The lock proves no holder owns a watcher, so one that the pid file still records outlived its holder, which died without TERM.
+        stop_watch(e, session, "(stale)")
+        # Written through a dot file and a rename, so a shrink never reads half a record.
+        write(f"{last_dir}/.{os.getpid()}", f"{worktree}\n{e}\n")
+        os.replace(f"{last_dir}/.{os.getpid()}", f"{last_dir}/{hashlib.sha1(os.fsencode(worktree)).hexdigest()}")
+        # Not "using" yet: a caller that stops reading at this line must not take the env for leased.
+        err(f"envlock: preparing {e}")
+        if mismatch and not run_configure(e):
+            sys.exit(1)
+        # Hook output goes to stderr, so stdout carries only the env name. The hooks below run as plain commands, so errexit applies inside them; a failing one ends envlock with its status, which is logged under its stage.
+        if "envpool_reset" in FUNCS:
+            run_plain("reset", "envpool_reset", e)
+        if "envpool_attach" in FUNCS:
+            if read(f"{envdir}/{e}.attached") == worktree and ("envpool_healthy" not in FUNCS or hook("envpool_healthy", out=2) == 0):
+                err(f"envlock: {e} already serves {worktree}")
+            else:
+                # The record is written only after a switch that succeeded; a failing hook exits before it.
+                rm(f"{envdir}/{e}.attached")
+                run_plain("attach", "envpool_attach", e)
+                write(f"{envdir}/{e}.attached", f"{worktree}\n")
+        if fresh:
+            run_plain("fresh", "envpool_fresh", e)
+            log("fresh", e, label, "pane", session)
+        # The pid file is written before the holder starts, because the holder reads it when the lease ends.
+        if watch:
+            start_watch(e)
+        # The holder inherits fd 9 and keeps the lease until the wait that it runs as a child returns.
+        ready, ready_w = os.pipe()
+        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+        try:
+            holder = detach(["__hold", e, session, lockdir, label, str(ready_w)], f"{lockdir}/holder.log", pass_fds=(9, ready_w))
+        finally:
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
+            os.close(ready_w)
+        os.read(ready, 1)
+        os.close(ready)
+        write(f"{envdir}/{e}.holder", f"{worktree} ({branch}) pane {session} pid {holder.pid}\n")
+        log("leased", e, label, "pane", session, "pid", holder.pid)
+        os.close(9)
+        err(f"envlock: using {e}")
+        emit(1, e) or sys.exit(1)
+        show_info(e)
+        trim_log()
+        # The background grow, shrink and suspend run hooks for other envs, which must not see this env's slot.
+        del os.environ["ENVLOCK_SLOT"]
+        headroom() or shrink_in_background()
+    finally:
+        rm(qentry)
+
+
+def cmd_acquire(args):
+    global urgent, fresh, watch, session
+    wait = 0
+    it = iter(args)
+    for a in it:
+        if a == "--urgent":
+            urgent = True
+        elif a == "--fresh":
+            fresh = True
+        elif a == "--watch":
+            watch = True
+        elif a == "--wait":
+            try:
+                wait = int(next(it, ""))
+            except ValueError:
+                usage()
+        elif a in ("--need", "--want"):
+            v = next(it, "")
+            if "=" not in v[1:-1]:
+                err(f"envlock: {a} needs key=value")
+                sys.exit(2)
+            (need if a == "--need" else want).append(v)
+        else:
+            usage()
+    if "envpool_describe" not in FUNCS:
+        if need:
+            err("envlock: --need requires envpool_describe in .envpool")
+            sys.exit(1)
+        if want:
+            err("envlock: ignoring --want, .envpool has no envpool_describe")
+        want.clear()
+    if fresh and "envpool_fresh" not in FUNCS:
+        err("envlock: --fresh requires envpool_fresh in .envpool")
+        sys.exit(1)
+    if watch and "envpool_watch" not in FUNCS:
+        err("envlock: --watch requires envpool_watch in .envpool")
+        sys.exit(1)
+    session = session_id()
+    if not session:
+        sys.exit(1)
+    lease = find_lease()
+    if lease:
+        lease_env = lease[0]
+        os.environ["ENVLOCK_SLOT"] = env_slot(lease_env)
+        if not needs_met(lease_env):
+            if "envpool_configure" not in FUNCS:
+                err(f"envlock: {lease_env} lacks {' '.join(need)} and .envpool has no envpool_configure; run envlock release first")
+                sys.exit(1)
+            if not run_configure(lease_env):
+                sys.exit(1)
+        if fresh:
+            rc = hook("envpool_fresh", out=2, ENVLOCK_ENV=lease_env, ENVLOCK_WORKTREE=worktree)
+            if rc:
+                log("fresh-failed", lease_env, label, "pane", session, f"exit={rc}")
+                err(f"envlock: refreshing {lease_env} failed; the lease is unchanged")
+                sys.exit(rc)
+            log("fresh", lease_env, label, "pane", session)
+        # A watcher that is still running stays; one that is not gets replaced.
+        if watch and not watch_pid(lease_env):
+            start_watch(lease_env)
+        log("reused", lease_env, label, "pane", session)
+        emit(1, lease_env) or sys.exit(1)
+        show_info(lease_env)
+        sys.exit(0)
+    release_pane_lease()
+    acquire(wait)
+
+
+def cmd_status():
+    load_envs()
+    busy = absent = 0
+    lines = []
+    for e in ALL:
+        if is_missing(e):
+            absent += 1
+            lines.append(f"{e}  not created")
+            continue
+        attrs = describe(e)
+        attrs = f"  {attrs}" if attrs else ""
+        if is_free(f"{envdir}/{e}.lock"):
+            susp = ", suspended" if os.path.exists(f"{envdir}/{e}.suspended") else ""
+            lines.append(f"{e}  free{susp}{attrs}")
+        else:
+            busy += 1
+            holder = read(f"{envdir}/{e}.holder")
+            lines.append(f"{e}  held by {'unknown' if holder is None else holder}{attrs}")
+    q = queue_entries()
+    emit(1, f"{busy}/{len(ALL)} in use, {len(ALL) - busy - absent} free, {len(q)} queued, cap {MAX_RAW or 'none'}")
+    for line in lines:
+        emit(1, line)
+    for i, f in enumerate(q):
+        emit(1, f"queued {i + 1}  {read(f) or ''}")
+    emit(1, f"events log: {lockdir}/events.log")
+
+
+def setup():
+    global worktree, branch, label, lockdir, envdir, queue_dir, last_dir, pool
+    worktree = git("rev-parse", "--show-toplevel")
+    branch = git("-C", worktree, "branch", "--show-current")
+    # Names the worktree in the events log; a detached HEAD has no branch.
+    label = branch or os.path.basename(worktree)
+    # Locks live per repository, not per worktree, so every worktree shares one pool.
+    common = os.path.realpath(os.path.join(worktree, git("rev-parse", "--git-common-dir", cwd=worktree)))
+    state = f"{os.environ.get('XDG_STATE_HOME') or os.path.expanduser('~/.local/state')}/envlock"
+    lockdir = f"{state}/{hashlib.sha1(os.fsencode(common)).hexdigest()[:12]}"
+    # Each env's .lock, .holder, .attached and .suspended files live here, outside the per-repo directory, so repos that list the same env share one lock.
+    envdir = f"{state}/envs"
+    queue_dir = f"{lockdir}/queue"
+    # One record per worktree: its path on line 1 and the env it leased last on line 2.
+    last_dir = f"{lockdir}/last"
+    for d in (queue_dir, last_dir, envdir):
+        os.makedirs(d, exist_ok=True)
+    # Fall back to the main checkout, so an untracked .envpool serves every worktree.
+    pool = f"{worktree}/.envpool"
+    if not os.path.isfile(pool):
+        pool = f"{os.path.dirname(common)}/.envpool"
+    if not os.path.isfile(pool):
+        err(f"envlock: no .envpool in {worktree} or the main checkout; ask your agent to set up a pool (see README)")
+        sys.exit(1)
+    load_pool()
+    # An empty ENVS is fine when the pool can grow from zero.
+    if not ENVS and not (MAX_N > 0 and PREFIX and "envpool_create" in FUNCS):
+        err("envlock: .envpool sets no ENVS")
+        sys.exit(1)
+
+
+need, want = [], []
+urgent = fresh = watch = False
+
+
+def main():
+    global lockdir, label
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    # Checked before any repo or pool lookup, so help works anywhere.
+    if cmd in ("-h", "--help", "help"):
+        usage(0)
+    if cmd not in ("acquire", "env", "release", "status", "grow", "shrink", "suspend", "__hold", "__background"):
+        usage()
+    # A caller that closes the pipe (`| head -1`) then makes writes fail instead of killing envlock mid-attach with SIGPIPE.
+    signal.signal(signal.SIGPIPE, signal.SIG_IGN if cmd == "acquire" else signal.SIG_DFL)
+    args = sys.argv[2:]
+    if cmd == "__hold":
+        lockdir, label = args[2:4]
+        return hold(args[0], args[1], args[4])
+    if cmd == "__background":
+        for step in args:
+            subprocess.run([sys.executable, sys.argv[0], step], check=False, **POPEN)
+        return None
+    setup()
+    if cmd == "status":
+        cmd_status()
+    elif cmd == "acquire":
+        cmd_acquire(args)
+    elif cmd == "env":
+        lease = find_lease()
+        if not lease:
+            return 1
+        emit(1, lease[0])
+    elif cmd == "release":
+        lease = find_lease()
+        if not lease:
+            emit(1, f"envlock: no lease held by {worktree}")
+            return 0
+        env, pid, pane = lease
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+        except OSError as ex:
+            err(f"envlock: kill {pid}: {ex.strerror}")
+            return 1
+        log("released", env, label, "pane", pane, "(release)")
+        emit(1, f"envlock: released {env} (pid {pid})")
+    elif cmd == "grow":
+        # A grow that acquire runs itself does not suspend: the waiter takes the new env at once.
+        rc = grow(args[0] if args else "")
+        return suspend() if rc == 0 and can_suspend() else rc
+    elif cmd == "shrink":
+        return shrink()
+    else:
+        return suspend()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
