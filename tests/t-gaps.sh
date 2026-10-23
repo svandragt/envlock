@@ -51,9 +51,11 @@ check "with e2 busy the missing e1 is created and leased" bash -c '[ "$0" = e1 ]
 idle_all
 echo "  -- a failing create leaves the env unusable and runs once per acquire"
 fresh g1d; export TEST_ENVS=e1 TEST_DISK=$T/disk TEST_CFAIL=1
-acq "$T/repo" --wait 2
-say "rc=$RC err=[$(echo "$ERR" | tr '\n' ';')] log=[$(tr '\n' ';' <"$TEST_LOG")]"
-check "acquire exits 75" [ "$RC" = 75 ]
+t0=$SECONDS; acq "$T/repo" --wait 30; dt=$((SECONDS - t0))
+say "rc=$RC after ${dt}s err=[$(echo "$ERR" | tr '\n' ';')] log=[$(tr '\n' ';' <"$TEST_LOG")]"
+check "nothing exists and the create failed, so acquire exits 1 at once instead of waiting" bash -c '[ "$0" = 1 ] && [ "$1" -lt 5 ]' "$RC" "$dt"
+check "stderr says there is nothing to wait for and names the events log" bash -c 'grep -q "no environment exists and creating one failed, nothing to wait for (see $1/events.log)" <<<"$0"' "$ERR" "$LD"
+check "the queue entry is gone" bash -c '[ -z "$(ls "$0/queue")" ]' "$LD"
 check "create ran once and failed" bash -c '[ "$(grep -c "^create e1" "$0")" = 1 ] && grep -qE " create-failed e1 exit=1$" "$1/events.log"' "$TEST_LOG" "$LD"
 check "no created line, no reset or attach, e1 free" bash -c '! grep -q " created " "$0/events.log" && ! grep -qE "^(reset|attach)" "$1"' "$LD" "$TEST_LOG"
 check "e1 free" free e1
@@ -61,6 +63,23 @@ unset TEST_CFAIL
 acq "$T/repo" --wait 30
 check "the next acquire creates it" [ "$OUT" = e1 ]
 idle "$PANE"
+echo "  -- a failed create and a failed grow with nothing in the pool end the acquire"
+fresh g1g; export TEST_ENVS=x2 TEST_PREFIX=x TEST_MAX=3 TEST_DISK=$T/disk TEST_CFAIL=1
+t0=$SECONDS; acq "$T/repo" --wait 30; dt=$((SECONDS - t0))
+say "rc=$RC after ${dt}s err=[$(echo "$ERR" | tr '\n' ';')] log=[$(tr '\n' ';' <"$TEST_LOG")]"
+check "acquire exits 1 at once" bash -c '[ "$0" = 1 ] && [ "$1" -lt 5 ]' "$RC" "$dt"
+check "x2 failed to create, then the grow of x3 failed, each once" bash -c '[ "$(grep -cE " create-failed x2 exit=1$" "$0/events.log")" = 1 ] && [ "$(grep -cE " grow-failed x3 exit=1$" "$0/events.log")" = 1 ] && ! grep -qE " timeout " "$0/events.log"' "$LD"
+check "the queue entry is gone" bash -c '[ -z "$(ls "$0/queue")" ]' "$LD"
+echo "  -- with an env that exists but is held, a failed create and grow still wait"
+fresh g1h; export TEST_ENVS="e1 e2" TEST_MAX=3 TEST_DISK=$T/disk; touch "$T/disk/e1"
+wt a
+acq "$T/repo" --wait 30
+export TEST_CFAIL=1
+acq "$T/a" --wait 2
+say "rc=$RC err=[$(echo "$ERR" | tr '\n' ';')]"
+check "e1 held, e2 and g2 fail to create, and acquire still waits until the timeout (75)" bash -c '[ "$0" = 75 ] && grep -qE " create-failed e2 exit=1$" "$1/events.log" && grep -qE " grow-failed g2 exit=1$" "$1/events.log"' "$RC" "$LD"
+unset TEST_CFAIL
+idle_all
 
 echo "G1f status shows a name that does not exist yet as not created"
 fresh g1f; export TEST_ENVS="e1 e2" TEST_DISK=$T/disk; touch "$T/disk/e2"

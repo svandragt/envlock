@@ -624,7 +624,7 @@ def run_plain(stage, hook_name, env):
 
 
 def acquire(wait):
-    """Leaves the lease on fd 9 and its env name in e; exits 75 when none frees up within wait seconds."""
+    """Leaves the lease on fd 9 and its env name in e; exits 75 when none frees up within wait seconds, and 1 when none exists and creating one failed."""
     deadline = time.monotonic() + wait
     grow_failed = mismatch = False
     create_failed = set()
@@ -663,6 +663,10 @@ def acquire(wait):
                     grow_failed = grow_failed or rc == 1
                     if rc == 0:
                         continue
+                # Every env is missing, each create failed and no grow can follow, so no lease will ever free up.
+                if all(x in create_failed and is_missing(x) for x in ALL) and (grow_failed or not can_grow()):
+                    err(f"envlock: no environment exists and creating one failed, nothing to wait for (see {lockdir}/events.log)")
+                    sys.exit(1)
             if time.monotonic() >= deadline:
                 err(f"envlock: all environments busy{' or lacking ' + ' '.join(need) if need else ''}")
                 log("timeout", label, "pane", session, *asks)
