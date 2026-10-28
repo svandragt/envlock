@@ -59,6 +59,17 @@ Run this once per fleet, before creating any worktree:
    `origin/<branch>`. If the user named none, ask which branch tickets start from. Use this
    ref wherever the steps below say `<base>`.
 
+3. Name your own session, so the ticket sessions can report to it:
+
+   ```bash
+   lead=$(printf 'lead-%s' "$(basename <repo>)" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_-' - | cut -c1-32)
+   herdr agent rename "$(herdr pane current | jq -r '.result.pane.pane_id')" "$lead"
+   ```
+
+   Use this name wherever the steps below say `<lead>`. A report arrives in your session as a
+   prompt. Read it, act on it within the plan, and pass to the user only what needs their
+   decision.
+
 ## Steps for each ticket
 
 1. Get the ticket title. Use the title the user gave. Otherwise look it up in the
@@ -71,8 +82,11 @@ Run this once per fleet, before creating any worktree:
 2. Create the worktree without taking focus:
 
    ```bash
-   herdr worktree create --cwd <repo> --branch <branch> --label "<label>" --base <base> --no-focus
+   herdr worktree create --cwd <repo> --branch <branch> --label "<label>" --base <base> --no-focus \
+     --path ~/.herdr/worktrees/$(basename <repo>)/.$(printf '%s' "<branch>" | tr 'A-Z' 'a-z')
    ```
+
+   The folder name starts with `.`, so herdr-dash hides the session until it is blocked.
 
    A `<base>` of `origin/preprod` gives `--base origin/preprod`. Read `root_pane.pane_id`, `workspace.workspace_id` and `worktree.path` from the
    JSON (under `.result` if the output has that wrapper). If the command fails,
@@ -126,6 +140,59 @@ Run this once per fleet, before creating any worktree:
    - `envlock release` ends the lease early.
    - Never use the seed environment or another session's environment directly.
    - `envlock status` shows who holds which environment and who is queued.
+   - Report to the lead without being asked. At the end of any turn where your plan is ready
+     for approval, a step finishes, you are blocked, you need a decision, or you stop, run
+     `herdr agent prompt <lead> "[<ticket>] <done|blocked|decision|stopping>: <one line>"`.
+     Put the detail in your own pane, not in the report. If the prompt fails, send it again at
+     the end of your next turn, and never wait for a reply.
+   - Before you open a PR as ready for review, or mark a draft ready, run `/code-review --fix`
+     and commit what it fixes.
+   - When you report a status, include your PR's state from
+     `gh pr view <number> --json state,reviewDecision,reviews`: merged, approved, changes
+     requested or waiting. "Nothing left" needs that check, because a review can arrive
+     after you stop.
+
+## Status checks
+
+To ask the fleet for a status, run `gh pr view` for each ticket's PR yourself first, then ask
+each session about anything GitHub can't show: uncommitted or unpushed work and envlock leases.
+Compare their answers with the PR states before proposing to close or keep a workspace.
+
+## Resume a fleet
+
+herdr forgets agent names when it restarts, so prompts to a session fail with
+`agent_not_found` and its reports to `<lead>` fail too. Before you send the first prompt to
+a resumed fleet, name each session again:
+
+1. Name your own session `<lead>`, as in step 3 of "Before the tickets".
+2. Run `herdr agent list`. For each pane whose `cwd` is a worktree of `<repo>`, run
+   `herdr agent rename <pane_id> <name>`. Build `<name>` as in step 3 of "Steps for each
+   ticket", from the last part of the worktree path without its leading `.`. That part is the
+   branch the worktree was created with, so the name stays the same even if the session later
+   switched branch.
+
+## Branches without a PR
+
+A session can leave finished work on local branches that never get a PR, for example per-change
+branches it tested together on an integration branch. Before you tick a ticket's checklist item,
+move the ticket to QA, or stand the fleet down, compare the ticket's branches with its PRs:
+
+```bash
+git -C <repo> branch --list '<ticket>*' --format='%(refname:short)'
+gh pr list -R <owner/repo> --state all --search '<ticket>' --json headRefName -q '.[].headRefName'
+```
+
+Report every branch that has commits not on `<base>` and no PR, with its last commit subject.
+Don't tick the item or move the ticket until each one has a PR or the user says to drop it.
+
+## Stand down
+
+1. Run the branch check above for every ticket in the fleet.
+2. For each worktree, check `git status --short` and `git log @{u}..HEAD`. Report uncommitted or
+   unpushed work, and stop before closing that workspace.
+3. Close each clean workspace with `herdr workspace close <workspace_id>`. Leave the worktrees and
+   branches until their PRs merge.
+4. Run `envlock status` and check that no environment is still held.
 
 ## Finish
 
