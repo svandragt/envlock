@@ -147,6 +147,8 @@ Run this once per fleet, before creating any worktree:
      the end of your next turn, and never wait for a reply.
    - Before you open a PR as ready for review, or mark a draft ready, run `/code-review --fix`
      and commit what it fixes.
+   - Before you list anything under "Not checked" in a PR body, try to check it. Only what
+     can't be checked from here stays on the list, with the reason.
    - When you report a status, include your PR's state from
      `gh pr view <number> --json state,reviewDecision,reviews`: merged, approved, changes
      requested or waiting. "Nothing left" needs that check, because a review can arrive
