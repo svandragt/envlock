@@ -149,6 +149,9 @@ Run this once per fleet, before creating any worktree:
      and commit what it fixes.
    - Before you list anything under "Not checked" in a PR body, try to check it. Only what
      can't be checked from here stays on the list, with the reason.
+   - Size the PR body to the diff: put results in the PR and the method in your pane. Write the
+     body to a file and report `decision` with its path and word count before `gh pr create`
+     or `gh pr edit --body-file`. The lead checks it against the diff first.
    - When you report a status, include your PR's state from
      `gh pr view <number> --json state,reviewDecision,reviews`: merged, approved, changes
      requested or waiting. "Nothing left" needs that check, because a review can arrive
