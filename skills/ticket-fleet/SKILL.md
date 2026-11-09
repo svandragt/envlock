@@ -66,9 +66,13 @@ Run this once per fleet, before creating any worktree:
    herdr agent rename "$(herdr pane current | jq -r '.result.pane.pane_id')" "$lead"
    ```
 
-   Use this name wherever the steps below say `<lead>`. A report arrives in your session as a
-   prompt. Read it, act on it within the plan, and pass to the user only what needs their
-   decision.
+   This herdr name addresses your pane. Reports come back through Claude Code's
+   cross-session messages instead, never through `herdr agent prompt`: that command types
+   into the pane's input, so a report sent while the user is typing joins their unsent message.
+   Run `ListAgents` and take your own session name from its first line ("This session is
+   …"). Use that name wherever the steps below say `<lead>`. A report arrives in your session
+   as a cross-session message. Read it, act on it within the plan, and pass to the user only
+   what needs their decision.
 
 ## Steps for each ticket
 
@@ -120,6 +124,8 @@ Run this once per fleet, before creating any worktree:
    - If a pane shows a password prompt, a shell wrapper around `claude` is the cause.
 5. Send the brief only after the session is idle, with `herdr agent prompt <name> "<brief>"`.
    If the target is not accepted, use the name that `herdr agent list` shows for the pane.
+   Send later messages to a session with `SendMessage` to the name `ListAgents` shows for it,
+   because the user may be typing in that pane too.
    The brief says:
 
    - Your ticket is `<ticket>`. Read the ticket first, then work on it in this worktree.
@@ -141,10 +147,11 @@ Run this once per fleet, before creating any worktree:
    - Never use the seed environment or another session's environment directly.
    - `envlock status` shows who holds which environment and who is queued.
    - Report to the lead without being asked. At the end of any turn where your plan is ready
-     for approval, a step finishes, you are blocked, you need a decision, or you stop, run
-     `herdr agent prompt <lead> "[<ticket>] <done|blocked|decision|stopping>: <one line>"`.
-     Put the detail in your own pane, not in the report. If the prompt fails, send it again at
-     the end of your next turn, and never wait for a reply.
+     for approval, a step finishes, you are blocked, you need a decision, or you stop, send
+     `[<ticket>] <done|blocked|decision|stopping>: <one line>` to `<lead>` with the
+     `SendMessage` tool (load it with `ToolSearch "select:SendMessage"` if needed). Never use
+     `herdr agent prompt` for reports. Put the detail in your own pane, not in the report. If
+     the send fails, send it again at the end of your next turn, and never wait for a reply.
    - Before you open a PR as ready for review, or mark a draft ready, run `/code-review --fix`
      and commit what it fixes.
    - Before you list anything under "Not checked" in a PR body, try to check it. Only what
@@ -165,9 +172,9 @@ Compare their answers with the PR states before proposing to close or keep a wor
 
 ## Resume a fleet
 
-herdr forgets agent names when it restarts, so prompts to a session fail with
-`agent_not_found` and its reports to `<lead>` fail too. Before you send the first prompt to
-a resumed fleet, name each session again:
+herdr forgets agent names when it restarts, so `herdr agent prompt` to a session fails with
+`agent_not_found`. Reports through `SendMessage` use Claude Code session names and keep
+working. Before you send the first herdr prompt to a resumed fleet, name each session again:
 
 1. Name your own session `<lead>`, as in step 3 of "Before the tickets".
 2. Run `herdr agent list`. For each pane whose `cwd` is a worktree of `<repo>`, run
