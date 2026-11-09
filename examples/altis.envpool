@@ -29,10 +29,11 @@ envpool_wait_up() {
 	return 1
 }
 
+# --skip-themes and --skip-plugins: a new or leased worktree may not have run its theme's or plugins' composer install yet, and wp-cli loads both for every command.
 envpool_wp() {
 	local env=$1
 	shift
-	docker exec -u "$(id -u)" "$env-php" wp --url="$env.altis.dev" "$@"
+	docker exec -u "$(id -u)" "$env-php" wp --url="$env.altis.dev" --skip-themes --skip-plugins "$@"
 }
 
 # Starts env $1 on the code in directory $2, then puts composer.json and vendor/host back as they were.

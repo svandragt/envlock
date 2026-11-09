@@ -36,10 +36,11 @@ envpool_approot() {
 
 # Runs wp-cli in env $1 from its own directory, so the env must be running: ddev wp starts a stopped env, and ddev exec -p does too.
 # --allow-root is for rootless Docker, where the container user is root.
+# --skip-themes and --skip-plugins: a new or leased worktree may not have run its theme's or plugins' composer install yet, and wp-cli loads both for every command.
 envpool_wp() {
 	local env=$1 dir
 	shift
-	dir=$(envpool_approot "$env" running) && [ -n "$dir" ] && (cd "$dir" && ddev wp --allow-root "$@")
+	dir=$(envpool_approot "$env" running) && [ -n "$dir" ] && (cd "$dir" && ddev wp --allow-root --skip-themes --skip-plugins "$@")
 }
 
 # Removes what env $1 leaves in directory $2: the override and DDEV's router files for the env. .ddev/.gitignore lists the router files of the current name only, so git would see the old ones.
