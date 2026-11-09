@@ -26,10 +26,21 @@ You can leave a ticket and come back to it without re-explaining anything or sta
 
 ### Install
 
-Link the script onto your `PATH` and the skill into Claude Code:
+Link the script onto your `PATH`:
 
 ```bash
 ln -s "$PWD/bin/envlock" ~/.local/bin/envlock
+```
+
+Install the skill with the [skills CLI](https://skills.sh/):
+
+```bash
+npx skills add svandragt/envlock
+```
+
+Or link it into Claude Code from your clone:
+
+```bash
 ln -s "$PWD/skills/ticket-fleet" ~/.claude/skills/ticket-fleet
 ```
 
