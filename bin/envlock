@@ -273,7 +273,8 @@ def start_watch(env):
 # The pool's own stdout goes to stderr, so it cannot end up in the list.
 LOADER = r"""set -euo pipefail
 source "$1" >&2
-for f in $(compgen -A function envpool_); do printf 'f:%s\0' "$f"; done
+# declare -F, not compgen: devbox's bash is built without programmable completion, so it has no compgen.
+declare -F | while read -r _ _ f; do [[ $f != envpool_* ]] || printf 'f:%s\0' "$f"; done
 for e in ${ENVS[@]+"${ENVS[@]}"}; do printf 'e:%s\0' "$e"; done
 printf 'm:%s\0p:%s\0' "${ENVPOOL_MAX:-}" "${ENVPOOL_PREFIX:-}"
 """

@@ -217,4 +217,12 @@ say "the waiter took the freed env after ${ms}ms with ENVLOCK_POLL=$ENVLOCK_POLL
 check "the waiter leased the freed env within 3s" bash -c '[ "$0" = a ] && [ "$1" -lt 3000 ]' "$(cat "$T/w8.out")" "$ms"
 idle pw8
 
+echo "G9 a bash without compgen, as in a devbox shell, still loads the pool"
+fresh g9
+printf 'enable -n compgen\n' >"$T/nocompgen"
+OUT=$(cd "$T/repo" && BASH_ENV=$T/nocompgen "$EL" status 2>&1); RC=$?
+say "rc=$RC out=$OUT"
+check "status succeeds" [ "$RC" = 0 ]
+check "no compgen error" bash -c '! grep -q compgen <<<"$0"' "$OUT"
+
 summary
