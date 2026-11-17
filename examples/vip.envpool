@@ -12,6 +12,8 @@ ENVPOOL_TITLE="Example site"
 ENVPOOL_MULTISITE=subdirectory
 ENVPOOL_MU_PLUGINS=demo
 ENVPOOL_MEDIA_DOMAIN=https://www.example.org
+# Set this to what production runs: a lease on an env with older versions configures it up to these first.
+# ENVPOOL_MIN="wp=7.1 php=8.2"
 
 # vip is an npm global in the main checkout's devbox; worktree devboxes lack it.
 ENVPOOL_MAIN=$(dirname "$(realpath "${BASH_SOURCE[0]}")")
@@ -77,8 +79,9 @@ envpool_describe() {
 # Changes $ENVLOCK_ENV to the wanted versions, for example: envpool_configure wp=6.9 php=8.3
 # Clones copy the seed's database, so an older WordPress version runs on a newer database schema.
 # envlock calls this inside an if, where set -e is off, so the steps are chained with &&.
+# The last step brings the database schema up to the new WordPress version, which the version change alone does not.
 envpool_configure() {
-	local flags=() pair
+	local flags=() net=() pair
 	for pair in "$@"; do
 		case $pair in
 		wp=*) flags+=(--wordpress="${pair#wp=}") ;;
@@ -86,8 +89,10 @@ envpool_configure() {
 		*) echo "envpool_configure: unknown attribute $pair" >&2; return 1 ;;
 		esac
 	done
+	jq -e .multisite "$HOME/.local/share/vip/dev-environment/$ENVLOCK_ENV/instance_data.json" >/dev/null && net=(--network)
 	vip dev-env update --slug="$ENVLOCK_ENV" "${flags[@]}" &&
-		vip dev-env start --slug="$ENVLOCK_ENV" --skip-wp-versions-check
+		vip dev-env start --slug="$ENVLOCK_ENV" --skip-wp-versions-check &&
+		envpool_wp "$ENVLOCK_ENV" core update-db "${net[@]}"
 }
 
 envpool_table_count() {

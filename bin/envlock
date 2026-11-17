@@ -14,6 +14,7 @@
 # acquire --want key=value only prefers an env that has them.
 # envpool_configure key=value... (sees ENVLOCK_ENV, same contract as
 # envpool_create) changes an env that lacks a needed pair, before reset and attach.
+# ENVPOOL_MIN="key=version ..." sets the oldest version a plain acquire may lease; an env below it is configured like one that lacks a needed pair.
 # envpool_info (sees ENVLOCK_ENV and ENVLOCK_WORKTREE) prints a hint for the caller,
 # such as a login URL, after every successful acquire, new lease or reuse.
 # envpool_suspend (sees ENVLOCK_ENV, same contract as envpool_destroy) stops a spare env
@@ -25,6 +26,7 @@
 import fcntl
 import hashlib
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -276,12 +278,12 @@ source "$1" >&2
 # declare -F, not compgen: devbox's bash is built without programmable completion, so it has no compgen.
 declare -F | while read -r _ _ f; do [[ $f != envpool_* ]] || printf 'f:%s\0' "$f"; done
 for e in ${ENVS[@]+"${ENVS[@]}"}; do printf 'e:%s\0' "$e"; done
-printf 'm:%s\0p:%s\0' "${ENVPOOL_MAX:-}" "${ENVPOOL_PREFIX:-}"
+printf 'm:%s\0p:%s\0n:%s\0' "${ENVPOOL_MAX:-}" "${ENVPOOL_PREFIX:-}" "${ENVPOOL_MIN:-}"
 """
 
 
 def load_pool():
-    global FUNCS, ENVS, MAX_RAW, MAX_N, PREFIX
+    global FUNCS, ENVS, MAX_RAW, MAX_N, PREFIX, MIN
     p = subprocess.run(["bash", "-c", LOADER, "_", pool], stdout=PIPE, check=False, **POPEN)
     if p.returncode:
         sys.exit(p.returncode)
@@ -290,6 +292,7 @@ def load_pool():
     ENVS = [f[2:] for f in fields if f.startswith("e:")]
     MAX_RAW = next(f[2:] for f in fields if f.startswith("m:"))
     PREFIX = next(f[2:] for f in fields if f.startswith("p:"))
+    MIN = next(f[2:] for f in fields if f.startswith("n:")).split()
     try:
         MAX_N = int(MAX_RAW)
     except ValueError:
@@ -333,15 +336,37 @@ def has_all(attrs, pairs):
     return all(f" {pair} " in f" {attrs} " for pair in pairs)
 
 
+def ver(s):
+    """s as a tuple of numbers, or None when it is not a dotted version such as 7.1.4."""
+    return tuple(map(int, s.split("."))) if re.fullmatch(r"[0-9]+(\.[0-9]+)*", s) else None
+
+
+def below_min(attrs):
+    """The ENVPOOL_MIN pairs that attrs is older than, compared field by field, so 7.10 is newer than 7.9 and 7.1.4 meets 7.1. A missing or non-version value counts as older."""
+    have = dict(p.split("=", 1) for p in attrs.split() if "=" in p)
+    low = []
+    for pair in MIN:
+        key, _, floor = pair.partition("=")
+        v = ver(have.get(key, ""))
+        if v is None or v < ver(floor):
+            low.append(pair)
+    return low
+
+
 def needs_met(env):
-    """True when env has every --need pair; with no --need every env does."""
-    return not need or has_all(describe(env), need)
+    """True when env has every --need pair and is not below ENVPOOL_MIN; with neither, every env does."""
+    if not need and not MIN:
+        return True
+    attrs = describe(env)
+    return has_all(attrs, need) and not below_min(attrs)
 
 
 def run_configure(env):
-    """Runs envpool_configure on env for the needed pairs. After a failure the env is in an unknown state, so the attach record goes."""
-    err(f"envlock: configuring {env} for {' '.join(need)}")
-    rc = hook("envpool_configure", *need, out=2, ENVLOCK_ENV=env, ENVLOCK_WORKTREE=worktree)
+    """Runs envpool_configure on env for the needed pairs, plus the ENVPOOL_MIN pairs it is below for keys --need does not name. It never lowers a version that is above the minimum. After a failure the env is in an unknown state, so the attach record goes."""
+    named = {p.split("=")[0] for p in need}
+    pairs = need + [m for m in below_min(describe(env)) if m.split("=")[0] not in named]
+    err(f"envlock: configuring {env} for {' '.join(pairs)}")
+    rc = hook("envpool_configure", *pairs, out=2, ENVLOCK_ENV=env, ENVLOCK_WORKTREE=worktree)
     if rc:
         log("configure-failed", env, label, "pane", session, f"exit={rc}")
         rm(f"{envdir}/{env}.attached")
@@ -597,14 +622,14 @@ def release_pane_lease():
 
 def try_order():
     """The pool in the order acquire tries it: envs with the needed attributes before the rest, then envs with the wanted ones, then envs whose holder names this worktree. Envs that still have to be created come after all the others, because creating takes minutes.
-    Without envpool_configure an env that lacks a needed pair is left out."""
+    An env below ENVPOOL_MIN ranks like one that lacks a needed pair. Without envpool_configure such an env is left out."""
     tier = {}
     for e in ALL:
         attrs = ""
         m = 8 if is_missing(e) else 0
-        if (need or want) and not m:
+        if (need or want or MIN) and not m:
             attrs = describe(e)
-        n = 0 if has_all(attrs, need) else 4
+        n = 0 if has_all(attrs, need) and not below_min(attrs) else 4
         w = 0 if has_all(attrs, want) else 2
         h = 0 if (read(f"{envdir}/{e}.holder") or "").startswith(f"{worktree} (") else 1
         tier[e] = n + w + h + m
@@ -752,6 +777,10 @@ def cmd_acquire(args):
             if "=" not in v[1:-1]:
                 err(f"envlock: {a} needs key=value")
                 sys.exit(2)
+            low = [m for m in below_min(v) if m.startswith(v.split("=")[0] + "=")]
+            if low:
+                err(f"envlock: {a} {v} is older than ENVPOOL_MIN {low[0]}")
+                sys.exit(2)
             (need if a == "--need" else want).append(v)
         else:
             usage()
@@ -777,7 +806,7 @@ def cmd_acquire(args):
         os.environ["ENVLOCK_SLOT"] = env_slot(lease_env)
         if not needs_met(lease_env):
             if "envpool_configure" not in FUNCS:
-                err(f"envlock: {lease_env} lacks {' '.join(need)} and .envpool has no envpool_configure; run envlock release first")
+                err(f"envlock: {lease_env} does not meet {' '.join(need + MIN)} and .envpool has no envpool_configure; run envlock release first")
                 sys.exit(1)
             if not run_configure(lease_env):
                 sys.exit(1)
@@ -809,6 +838,7 @@ def cmd_status():
             lines.append(f"{e}  not created")
             continue
         attrs = describe(e)
+        attrs = " ".join([attrs, *(f"(below {m.partition('=')[2]})" for m in below_min(attrs))]).strip()
         attrs = f"  {attrs}" if attrs else ""
         if is_free(f"{envdir}/{e}.lock"):
             susp = ", suspended" if os.path.exists(f"{envdir}/{e}.suspended") else ""
@@ -851,6 +881,12 @@ def setup():
         err(f"envlock: no .envpool in {worktree} or the main checkout; ask your agent to set up a pool (see README)")
         sys.exit(1)
     load_pool()
+    if MIN and "envpool_describe" not in FUNCS:
+        err("envlock: ENVPOOL_MIN requires envpool_describe in .envpool")
+        sys.exit(1)
+    if any(ver(m.partition("=")[2]) is None for m in MIN):
+        err(f"envlock: ENVPOOL_MIN needs key=version pairs, such as wp=7.1, not {' '.join(MIN)}")
+        sys.exit(1)
     # An empty ENVS is fine when the pool can grow from zero.
     if not ENVS and not (MAX_N > 0 and PREFIX and "envpool_create" in FUNCS):
         err("envlock: .envpool sets no ENVS")
