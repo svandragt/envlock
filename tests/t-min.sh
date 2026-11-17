@@ -103,6 +103,16 @@ acq "$T/repo"
 check "an env at the minimum is leased instead (e2)" [ "$OUT" = e2 ]
 idle "$PANE"
 
+echo "M7c reuse without envpool_configure names only what the env misses"
+mfresh m7c; withattrs; export TEST_ENVS=e1
+setattrs e1 wp=7.2 php=8.0
+acq "$T/repo"; idle "$PANE"
+export ENVPOOL_MIN="wp=7.1 php=8.2"
+acq "$T/repo"
+say "OUT=[$OUT] rc=$RC stderr=[$ERR]"
+check "the error names php=8.2" grep -q "php=8.2" <<<"$ERR"
+check "the error does not name wp=7.1" bash -c '! grep -q "wp=7.1" <<<"$0"' "$ERR"
+
 echo "M8 ENVPOOL_MIN needs envpool_describe and version pairs"
 mfresh m8; export ENVPOOL_MIN="wp=7.1"
 elrun repo status
@@ -119,7 +129,7 @@ mfresh m9; withattrs; export TEST_ENVS="e1 e2" ENVPOOL_MIN="wp=7.1 php=8.2"
 setattrs e1 wp=6.9 php=8.0; setattrs e2 wp=7.2 php=8.4
 elrun repo status
 say "$OUT"
-check "e1 shows each key it is below" grep -qx "e1  free  wp=6.9 php=8.0 (below 7.1) (below 8.2)" <<<"$OUT"
+check "e1 shows each key it is below" grep -qx "e1  free  wp=6.9 php=8.0 (wp below 7.1) (php below 8.2)" <<<"$OUT"
 check "e2 shows nothing" grep -qx "e2  free  wp=7.2 php=8.4" <<<"$OUT"
 
 summary

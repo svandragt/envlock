@@ -355,12 +355,17 @@ def below_min(attrs):
     return low
 
 
+def unmet(env):
+    """The --need pairs env lacks plus the ENVPOOL_MIN pairs it is below; with neither set, nothing is unmet."""
+    if not need and not MIN:
+        return []
+    attrs = describe(env)
+    return [p for p in need if not has_all(attrs, [p])] + below_min(attrs)
+
+
 def needs_met(env):
     """True when env has every --need pair and is not below ENVPOOL_MIN; with neither, every env does."""
-    if not need and not MIN:
-        return True
-    attrs = describe(env)
-    return has_all(attrs, need) and not below_min(attrs)
+    return not unmet(env)
 
 
 def run_configure(env):
@@ -806,9 +811,10 @@ def cmd_acquire(args):
     if lease:
         lease_env = lease[0]
         os.environ["ENVLOCK_SLOT"] = env_slot(lease_env)
-        if not needs_met(lease_env):
+        missing = unmet(lease_env)
+        if missing:
             if "envpool_configure" not in FUNCS:
-                err(f"envlock: {lease_env} does not meet {' '.join(need + MIN)} and .envpool has no envpool_configure; run envlock release first")
+                err(f"envlock: {lease_env} does not meet {' '.join(missing)} and .envpool has no envpool_configure; run envlock release first")
                 sys.exit(1)
             if not run_configure(lease_env):
                 sys.exit(1)
@@ -840,7 +846,7 @@ def cmd_status():
             lines.append(f"{e}  not created")
             continue
         attrs = describe(e)
-        attrs = " ".join([attrs, *(f"(below {m.partition('=')[2]})" for m in below_min(attrs))]).strip()
+        attrs = " ".join([attrs, *(f"({m.partition('=')[0]} below {m.partition('=')[2]})" for m in below_min(attrs))]).strip()
         attrs = f"  {attrs}" if attrs else ""
         if is_free(f"{envdir}/{e}.lock"):
             susp = ", suspended" if os.path.exists(f"{envdir}/{e}.suspended") else ""
