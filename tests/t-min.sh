@@ -43,6 +43,8 @@ min_case m3c wp=7.9 "wp=7.10" "configure e1 wp=7.10"
 min_case m3d wp=7.1 "wp=7.1.4" "configure e1 wp=7.1.4"
 min_case m3e wp=beta "wp=7.1" "configure e1 wp=7.1"
 min_case m3f php=8.4 "wp=7.1" "configure e1 wp=7.1"
+min_case m3g wp=7.1 "wp=7.1.0" none
+min_case m3h wp=7.1.0 "wp=7.1" none
 
 echo "M4 an env that meets the minimum wins over one that needs configuring"
 mfresh m4; withattrs; export TEST_ENVS="e1 e2" TEST_CONF=1 ENVPOOL_MIN="wp=7.1"
@@ -93,6 +95,7 @@ setattrs e1 wp=6.9
 acq "$T/repo" --wait 1
 say "OUT=[$OUT] rc=$RC log=[$(tr '\n' ';' <"$TEST_LOG")] stderr=[$ERR]"
 check "acquire gives up with 75 and leases nothing" bash -c '[ "$0" = 75 ] && [ -z "$1" ] && [ ! -s "$2" ]' "$RC" "$OUT" "$TEST_LOG"
+check "the timeout names the minimum" grep -q "below ENVPOOL_MIN wp=7.1" <<<"$ERR"
 check "e1 is free" free e1
 mfresh m7b; withattrs; export TEST_ENVS="e1 e2" ENVPOOL_MIN="wp=7.1"
 setattrs e1 wp=6.9; setattrs e2 wp=7.2

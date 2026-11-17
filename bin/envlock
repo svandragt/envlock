@@ -347,8 +347,10 @@ def below_min(attrs):
     low = []
     for pair in MIN:
         key, _, floor = pair.partition("=")
-        v = ver(have.get(key, ""))
-        if v is None or v < ver(floor):
+        v, f = ver(have.get(key, "")), ver(floor)
+        # Zero-padded to one length, so 7.1 meets 7.1.0.
+        n = max(len(v or ()), len(f))
+        if v is None or v + (0,) * (n - len(v)) < f + (0,) * (n - len(f)):
             low.append(pair)
     return low
 
@@ -694,7 +696,7 @@ def acquire(wait):
                     err(f"envlock: no environment exists and creating one failed, nothing to wait for (see {lockdir}/events.log)")
                     sys.exit(1)
             if time.monotonic() >= deadline:
-                err(f"envlock: all environments busy{' or lacking ' + ' '.join(need) if need else ''}")
+                err(f"envlock: all environments busy{' or lacking ' + ' '.join(need) if need else ''}{' or below ENVPOOL_MIN ' + ' '.join(MIN) if MIN else ''}")
                 log("timeout", label, "pane", session, *asks)
                 sys.exit(75)
             # ENVLOCK_POLL is a test seam: it lets the tests poll faster than every 5 seconds.
