@@ -107,7 +107,7 @@ Agents run `envlock acquire` themselves. To change what a ticket gets, tell its 
 
 `--need` and `--want` take any attribute the pool reports, such as `php=8.2`, and repeat for more than one.
 
-To keep tickets off old versions, set `ENVPOOL_MIN="wp=7.1 php=8.2"` in `.envpool` to what production runs. A ticket then gets an environment at or above those versions, and envlock updates one that is older before it leases it. `--need` and `--want` refuse an older version. Newer environments are leased as they are. VIP only.
+To keep tickets off old versions, set `ENVPOOL_MIN="wp=7.1 php=8.2"` in `.envpool` to what production runs. A ticket then gets an environment at or above those versions, and envlock updates one that is older before it leases it. `--need` and `--want` refuse an older version. Newer environments are leased as they are. VIP only. The pool's configure step must also update the database, as `wp core update-db` does in the VIP example.
 
 An agent that waits at a permission prompt keeps its lease. To free an environment early, run `envlock release` from the ticket's worktree. `envlock env` prints the environment that the worktree leases.
 
